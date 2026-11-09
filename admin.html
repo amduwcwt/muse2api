@@ -316,7 +316,7 @@
         </div>
       </div>
       <div class="hint" style="margin:11px 0 0" data-i18n="model-names-hint">
-        模型名：<code>muse-spark</code>（对话/代码）、<code>muse-image</code>（生图）、<code>muse-video</code>（生视频）。
+        模型名：<code>muse-spark</code>（智能路由）、<code>muse-wonder</code> / <code>muse-ember</code>（网页选卡）、<code>muse-image</code>（生图）、<code>muse-video</code>（生视频）。
         完整调用示例见「接入文档」页签。
       </div>
     </div>
@@ -604,14 +604,16 @@
       <div class="tblwrap"><table>
         <thead><tr><th>模型 ID</th><th>用途</th><th>接口</th></tr></thead>
         <tbody>
-          <tr><td class="mono">muse-spark</td><td>文本 / 代码对话（支持流式）</td><td class="mono">POST /v1/chat/completions<br>POST /v1/responses</td></tr>
+          <tr><td class="mono">muse-spark</td><td>智能路由（默认对话档，支持流式）</td><td class="mono">POST /v1/chat/completions<br>POST /v1/responses</td></tr>
+          <tr><td class="mono">muse-wonder</td><td>Wonder 选卡（更强更贵）</td><td class="mono">POST /v1/chat/completions<br>POST /v1/responses</td></tr>
+          <tr><td class="mono">muse-ember</td><td>Ember 选卡（更快更省）</td><td class="mono">POST /v1/chat/completions<br>POST /v1/responses</td></tr>
           <tr><td class="mono">muse-image</td><td>文生图 / 图像编辑</td><td class="mono">POST /v1/images/generations</td></tr>
           <tr><td class="mono">muse-video</td><td>文生视频 / 图生视频</td><td class="mono">POST /v1/videos → GET /v1/videos/{id}</td></tr>
         </tbody>
       </table></div>
       <div class="hint" style="margin-top:6px" data-i18n="models-hint">
         这三个就是 Muse 系列的真实能力：<b>Muse Spark</b>（语言 / 代码）、<b>Muse Image</b>（生图）、
-        <b>Muse Video</b>（生视频）。muse.ai 网页是自动路由的 agent、界面没有模型选择器，
+        <b>Muse Video</b>（生视频）。对话可选卡「智能路由 / Wonder / Ember」（OpenAI model 对应 muse-spark / muse-wonder / muse-ember），
         所以 <code>model</code> 字段只用于兼容下游 —— 传 <code>gpt-4o</code>、
         <code>claude-sonnet-4</code>、<code>dall-e-3</code> 等常见名字会自动映射到对应能力。
       </div>

@@ -271,7 +271,11 @@ async def _validation_exc(request: Request, exc: RequestValidationError):
 
 MODELS = [
     {"id": "muse-spark", "object": "model", "owned_by": "muse",
-     "description": "Muse Spark —— 文本 / 代码对话（网页免费额度，支持流式）"},
+     "description": "Muse 智能路由（网页默认档，等价选卡「智能路由」）"},
+    {"id": "muse-wonder", "object": "model", "owned_by": "muse",
+     "description": "Muse Wonder —— 更强更贵（网页选卡 Wonder，CDP 点选后发送）"},
+    {"id": "muse-ember", "object": "model", "owned_by": "muse",
+     "description": "Muse Ember —— 更快更省（网页选卡 Ember，CDP 点选后发送）"},
     {"id": "muse-image", "object": "model", "owned_by": "muse",
      "description": "Muse Image —— 文生图 / 图像编辑（网页免费额度）"},
     {"id": "muse-video", "object": "model", "owned_by": "muse",
@@ -281,11 +285,17 @@ MODELS = [
 # 下游（Codex / Cline / 各种客户端）习惯按 OpenAI、Anthropic 的名字传模型，
 # 这里统一映射到 muse 的真实能力上。
 #
-# 说明：muse.ai 网页是自动路由的 agent，对外**没有可枚举的模型清单**，
-# 能稳定调用的就是三条真实能力 —— Muse Spark（语言/代码）、
-# Muse Image（生图）、Muse Video（生视频）。别名只是让下游不用改配置。
+# 对话档位（网页选卡，经 CDP 点选）：
+#   muse-spark  = 智能路由（默认）
+#   muse-wonder = Wonder（更强更贵）
+#   muse-ember  = Ember（更快更省）
+# 另有 Muse Image（生图）、Muse Video（生视频）。别名只是让下游不用改配置。
 MODEL_ALIASES = {
-    # ---- 文本 / 代码 → muse-spark ----
+    # ---- 网页选卡 Wonder / Ember ----
+    "wonder": "muse-wonder", "muse-wonder-1.0": "muse-wonder",
+    "ember": "muse-ember", "muse-ember-1.0": "muse-ember",
+    "auto": "muse-spark", "muse-auto": "muse-spark", "智能路由": "muse-spark",
+    # ---- 文本 / 代码 → muse-spark（智能路由）----
     "muse-text": "muse-spark", "muse-chat": "muse-spark", "muse-llm": "muse-spark",
     "koda": "muse-spark",
     "gpt-3.5-turbo": "muse-spark", "gpt-4": "muse-spark", "gpt-4-turbo": "muse-spark",
@@ -314,6 +324,16 @@ MODEL_ALIASES = {
 def resolve_model(name: str | None, default: str = "muse-image") -> str:
     n = (name or "").strip().lower()
     return MODEL_ALIASES.get(n, n or default)
+
+
+def chat_model_card(resolved: str | None) -> str:
+    """把 OpenAI model id 映射到网页选卡：auto / wonder / ember。"""
+    n = (resolved or "").strip().lower()
+    if n in ("muse-wonder", "wonder"):
+        return "wonder"
+    if n in ("muse-ember", "ember"):
+        return "ember"
+    return "auto"
 
 
 # ------------------------- 鉴权 -------------------------
@@ -367,7 +387,8 @@ def _renew_and_persist(acc_id: str, wake_vm: bool = True, force: bool = False) -
 
 
 def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
-                     timeout: int, account_id: str | None):
+                     timeout: int, account_id: str | None,
+                     chat_model: str | None = None):
     """在独立线程中执行 chat_stream 并持有 GEN_LOCK，通过 Queue 往外吐。
     无论下游客户端何时断连、异常或超时，stop_event + finally 块保证 100% 立即释放 GEN_LOCK，绝不死锁。
     若首字前遇到单账号 VM 卡死或会话异常，自动切换下一个健康账号重试一次。"""
@@ -420,7 +441,8 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                         engine.start()
                         for chunk in engine.chat_stream(
                             cur_cookies, prompt, cur_exp, timeout,
-                            account_id=cur_id, stop_event=stop_event
+                            account_id=cur_id, stop_event=stop_event,
+                            chat_model=chat_model,
                         ):
                             yielded = True
                             q.put(("data", chunk))
@@ -1561,9 +1583,10 @@ _SSE_HEADERS = {
 async def chat_completions(req: ChatRequest, _=Depends(auth)):
     """OpenAI 兼容的对话接口 —— 各类智能体客户端都能接。
 
-    说明：muse.ai 网页是**自动路由**的 agent，界面上没有模型选择器，所有请求
-    都会落到同一个网页助手（自称 Koda，底层是 Muse 系列语言模型）。所以
-    `model` 字段只用于兼容下游，不影响路由结果。
+    说明：muse.ai 网页对话在内容出来后可选卡「智能路由 / Wonder / Ember」。
+    `model` 会映射到对应选卡（muse-spark→智能路由，muse-wonder→Wonder，
+    muse-ember→Ember），由 CDP 在发送前点选；底层仍是 Hatch Noise RPC
+    `model.set`，不是 Meta Model API。
 
     请求带 `tools` 时，会注入【工具调用协议】并把模型输出的 JSON 解析回
     `tool_calls`（muse.ai 没有原生 function calling，这层属于协议适配）。
@@ -1609,7 +1632,7 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
                 # 握手建立瞬间立即发送 role: assistant 首包，让下游客户端秒级捕获光标
                 yield _sse(_chat_chunk(cid, created, model, {"role": "assistant"}))
 
-                stream_gen = safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id)
+                stream_gen = safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id, chat_model=model)
                 if not tool_note:
                     for chunk in stream_gen:
                         for piece in _pace_text(chunk):
@@ -1671,7 +1694,7 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
         return StreamingResponse(sync_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
     def run() -> str:
-        return "".join(safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id))
+        return "".join(safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id, chat_model=model))
 
     try:
         text = await asyncio.to_thread(run)
@@ -1782,7 +1805,7 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
                     "part": {"type": "output_text", "text": "",
                              "annotations": []}})
                 full = ""
-                for chunk in safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id):
+                for chunk in safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id, chat_model=model):
                     full += chunk
                     yield _sse_event("response.output_text.delta", {
                         "type": "response.output_text.delta", "item_id": mid,
@@ -1807,7 +1830,7 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
         return StreamingResponse(sync_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
     def run() -> str:
-        return "".join(safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id))
+        return "".join(safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id, chat_model=model))
 
     try:
         text = await asyncio.to_thread(run)

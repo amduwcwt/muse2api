@@ -1471,13 +1471,162 @@ class MuseEngine:
             pass
         return 0, "", False
 
+    # ---------------- 网页选卡 Wonder / Ember / 智能路由 ----------------
+    # muse.ai 消费端走 Hatch Noise RPC：model.get / model.set（path /model，
+    # noiseOnly）。UI 在对话出内容后露出「智能路由 / Wonder / Ember」。
+    # 这里用 CDP 点选，与网页选卡一致；不走 Meta Model API。
+    _SELECT_CHAT_MODEL_JS = r"""
+(function(target){
+  function visible(el){
+    if(!el||!el.getBoundingClientRect) return false;
+    var r=el.getBoundingClientRect();
+    if(r.width<2||r.height<2) return false;
+    var s=getComputedStyle(el);
+    if(s.visibility==='hidden'||s.display==='none'||Number(s.opacity)===0) return false;
+    return el.offsetParent!==null || s.position==='fixed';
+  }
+  function txt(el){
+    return ((el.innerText||el.textContent||'')+' '
+      +(el.getAttribute('aria-label')||'')+' '
+      +(el.getAttribute('title')||'')+' '
+      +(el.getAttribute('data-testid')||'')).replace(/\s+/g,' ').trim();
+  }
+  function matchTarget(t,s){
+    s=(s||'');
+    var low=s.toLowerCase();
+    if(t==='wonder') return /wonder/i.test(s) || /更强/.test(s);
+    if(t==='ember') return /ember/i.test(s) || /更快/.test(s) || /更省/.test(s);
+    return /智能路由/.test(s) || /auto\s*rout/i.test(low)
+      || (/spark/i.test(low) && !/wonder|ember/i.test(low));
+  }
+  function score(el){
+    var role=(el.getAttribute('role')||'').toLowerCase();
+    var tag=el.tagName.toLowerCase();
+    if(role==='option'||role==='menuitem'||role==='radio') return 4;
+    if(tag==='button'||role==='button') return 3;
+    if(tag==='li'||tag==='div') return 2;
+    return 1;
+  }
+  var cand=[...document.querySelectorAll(
+    'button,[role=button],[role=option],[role=menuitem],[role=radio],li,div,span,a'
+  )].filter(visible);
+  var selected=cand.find(function(el){
+    var s=txt(el); if(s.length>48||!matchTarget(target,s)) return false;
+    var aria=el.getAttribute('aria-checked')||el.getAttribute('aria-selected')||'';
+    var cls=(el.className&&String(el.className))||'';
+    return aria==='true' || /selected|active|checked/i.test(cls);
+  });
+  if(selected) return JSON.stringify({ok:true,already:true,text:txt(selected).slice(0,80)});
+
+  var opts=cand.filter(function(el){
+    var s=txt(el); return s.length>0 && s.length<48 && matchTarget(target,s);
+  }).sort(function(a,b){return score(b)-score(a) || txt(a).length-txt(b).length;});
+  if(opts.length){
+    opts[0].click();
+    return JSON.stringify({ok:true,clicked:true,text:txt(opts[0]).slice(0,80)});
+  }
+
+  var triggers=cand.filter(function(el){
+    var s=txt(el); if(!s||s.length>48) return false;
+    return /智能路由|wonder|ember|模型|model|spark/i.test(s);
+  }).sort(function(a,b){return score(b)-score(a);});
+  if(!triggers.length){
+    return JSON.stringify({ok:false,err:'no-picker'});
+  }
+  triggers[0].click();
+  return JSON.stringify({ok:false,err:'opened',text:txt(triggers[0]).slice(0,80)});
+})(%s)
+"""
+
+    def _normalize_chat_card(self, chat_model: str | None) -> str:
+        n = (chat_model or "").strip().lower()
+        if n in ("wonder", "muse-wonder"):
+            return "wonder"
+        if n in ("ember", "muse-ember"):
+            return "ember"
+        return "auto"
+
+    def _select_chat_model_once(self, card: str) -> dict:
+        try:
+            raw = self.page.js(self._SELECT_CHAT_MODEL_JS % json.dumps(card))
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "err": f"js:{exc}"}
+        if not raw:
+            return {"ok": False, "err": "empty"}
+        try:
+            return json.loads(raw) if isinstance(raw, str) else dict(raw)
+        except Exception:  # noqa: BLE001
+            return {"ok": False, "err": str(raw)[:120]}
+
+    def _wait_generation_idle(self, timeout: float = 90.0, stop_event=None) -> None:
+        """等当前轮助手生成结束（不 yield），用于选卡前热身。"""
+        deadline = time.time() + timeout
+        last, stable = None, 0
+        while time.time() < deadline:
+            if stop_event is not None and stop_event.is_set():
+                return
+            time.sleep(0.12)
+            _cnt, cur, has_stop = self._poll_chat()
+            if not cur:
+                continue
+            if cur != last:
+                last, stable = cur, 0
+                continue
+            stable += 1
+            if not has_stop and stable >= 3:
+                return
+            if has_stop and stable >= 80:
+                return
+        # 热身超时不致命：后续选卡还会再试
+        log.warning("选卡热身等待回复超时")
+
+    def _ensure_chat_model(self, chat_model: str | None, stop_event=None,
+                           wait_s: float = 6.0) -> str:
+        """发送前确保网页选卡与请求一致。返回实际卡：auto/wonder/ember。"""
+        card = self._normalize_chat_card(chat_model)
+        deadline = time.time() + wait_s
+        last: dict = {}
+        while time.time() < deadline:
+            if stop_event is not None and stop_event.is_set():
+                return card
+            last = self._select_chat_model_once(card)
+            if last.get("ok"):
+                log.info("选卡就绪 target=%s already=%s text=%s",
+                         card, last.get("already"), last.get("text"))
+                return card
+            # opened → 菜单刚展开，稍等再点选项
+            time.sleep(0.28 if last.get("err") == "opened" else 0.4)
+        if card == "auto":
+            log.info("智能路由选卡未找到选择器，沿用页面默认: %s", last)
+            return card
+        # Wonder/Ember：空线程常不露选择器，先热身一条极短消息再选
+        log.info("选卡 %s 未就绪，热身后重试: %s", card, last)
+        try:
+            self._send(".")
+            self._wait_generation_idle(timeout=90.0, stop_event=stop_event)
+        except Exception as exc:  # noqa: BLE001
+            raise MuseGenerationError(f"选卡热身失败（{card}）: {exc}") from exc
+        deadline = time.time() + max(wait_s, 8.0)
+        while time.time() < deadline:
+            if stop_event is not None and stop_event.is_set():
+                return card
+            last = self._select_chat_model_once(card)
+            if last.get("ok"):
+                log.info("热身后选卡就绪 target=%s text=%s", card, last.get("text"))
+                return card
+            time.sleep(0.28 if last.get("err") == "opened" else 0.4)
+        raise MuseGenerationError(
+            f"无法切换到网页选卡 {card}（model.get/set UI 未出现或点击失败）: {last}"
+        )
+
     def chat_stream(self, cookies: dict, prompt: str, expires: dict | None = None,
                     timeout: int | None = None, account_id: str | None = None,
-                    stop_event=None):
+                    stop_event=None, chat_model: str | None = None):
         """发一条消息，流式 yield 增量文本。"""
         timeout = int(timeout or getattr(self.cfg, "chat_timeout", 300))
         self.ensure_page(cookies, expires, account_id=account_id)
         self.reset_thread(for_chat=True)
+        self._ensure_chat_model(chat_model, stop_event=stop_event)
         base_agent, base_text, _ = self._poll_chat()
         self._send(prompt)
 
@@ -1541,10 +1690,14 @@ class MuseEngine:
         raise MuseGenerationError("等待助手回复超时")
 
     def chat(self, cookies: dict, prompt: str, expires: dict | None = None,
-             timeout: int | None = None, account_id: str | None = None) -> str:
+             timeout: int | None = None, account_id: str | None = None,
+             chat_model: str | None = None) -> str:
         """发一条消息，返回完整回复文本（非流式）。"""
         out = ""
-        for chunk in self.chat_stream(cookies, prompt, expires, timeout, account_id=account_id):
+        for chunk in self.chat_stream(
+            cookies, prompt, expires, timeout, account_id=account_id,
+            chat_model=chat_model,
+        ):
             out += chunk
         return out
 
