@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "updated_at": 1762728600,
+  "entries": [
+    {
+      "id": "sc_example1",
+      "ledger_key": "role:ops",
+      "role": "ops",
+      "project": null,
+      "muse_account_id": "example_acc_ops",
+      "muse_account_label": "example-ops",
+      "session_id": "example-session-not-real",
+      "prior_session_id": null,
+      "label": "role:ops",
+      "status": "active",
+      "pin": false,
+      "created_at": 1762728000,
+      "last_used_at": 1762728600,
+      "use_count": 3,
+      "bubble_hint": null,
+      "notes": "示例条目。不要写入真实 sessionId 或登录凭据。"
+    },
+    {
+      "id": "sc_example2",
+      "ledger_key": "role:ops:proj:bridgeai",
+      "role": "ops",
+      "project": "bridgeai",
+      "muse_account_id": "example_acc_ops",
+      "muse_account_label": "example-ops",
+      "session_id": null,
+      "prior_session_id": null,
+      "label": "role:ops:proj:bridgeai",
+      "status": "pending",
+      "pin": false,
+      "created_at": 1762728500,
+      "last_used_at": null,
+      "use_count": 0,
+      "bubble_hint": null,
+      "notes": "首条发出后回填 session_id。同一 role 仍钉 example_acc_ops。"
+    }
+  ],
+  "role_account_map": {
+    "ops": "example_acc_ops",
+    "research": "example_acc_research",
+    "docs": "example_acc_docs",
+    "desktop": "example_acc_desktop",
+    "cloud": "example_acc_cloud",
+    "qa": "example_acc_qa",
+    "default": null
+  }
+}

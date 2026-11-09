@@ -248,6 +248,68 @@ curl -X POST "http://localhost:18610/v1/chat/completions" \
   }'
 ```
 
+不带角色的对话走**策略 A**：每次导航到空白旁聊 `/thread/new`，不再因为气泡少于 24 就接着上一条旁聊。已经停在空白草稿上时不会再导航一次。生图、生视频的换页规则不变。
+
+### 1.1 旁聊台账（角色 × 项目）
+
+有角色时走 **B×C**：`role` 钉一个 Muse 账号，`role` 或 `role` + `project` 钉一条旁聊。台账在运行时数据目录，和 `accounts.json` 同级：
+
+- 运行时：`data/sidechat_ledger.json`（或 `MUSE2API_HOME/data/sidechat_ledger.json`）。不要提交这个文件。
+- 仓库示例：`data/sidechat_ledger.example.json`（没有真实 sessionId，也没有 cookie）。
+
+**怎么传入 role / project**（同一字段按这个顺序，先有的生效）：
+
+1. 请求头 `X-Muse-Role`、`X-Muse-Project`（项目可省略）
+2. JSON 字段 `muse_role`、`muse_project`
+3. JSON 字段 `role`、`project`
+4. 都没有 role 时，若 OpenAI 的 `user` **整段**是 `role:<slug>` 或 `role:<slug>:proj:<slug>`，用这段。普通 user id（如 `user_123`）忽略，仍走策略 A。
+
+`slug` 是 1–64 位字母、数字、`_` 或 `-`，大小写不敏感，不能有空格或中文。只传 project 不传 role 会返回 400。
+
+```bash
+curl -X POST "http://localhost:18610/v1/chat/completions" \
+  -H "Authorization: Bearer m2a_your_secret_key" \
+  -H "Content-Type: application/json" \
+  -H "X-Muse-Role: ops" \
+  -H "X-Muse-Project: bridgeai" \
+  -d '{
+    "model": "muse-spark",
+    "messages": [{"role": "user", "content": "继续看昨天的告警"}],
+    "stream": false
+  }'
+```
+
+等价写法：`"muse_role": "ops", "muse_project": "bridgeai"`，或 `"user": "role:ops:proj:bridgeai"`。`/v1/responses` 使用同一套头和字段。`model` 仍是 `muse-spark` / `muse-wonder` / `muse-ember`，选卡逻辑不变。
+
+台账键：`role:ops`，或 `role:ops:proj:bridgeai`。字段见示例文件。`status` 为 `pending`（还没有 sessionId）、`active`（可续用）、`stale`（不再续用）、`deleted`（保留位）。`role_account_map` 把角色钉到账号池的 `id`；`default` 是没有单独映射时的兜底。映射不会自动改账号池。
+
+第一次使用某个键时，按映射选账号（映射的号不可用就换一个健康号），打开新旁聊，首条消息发出且 URL 变成 `/thread/<sessionId>` 后把 id 写回台账。之后同一键会打开这个 URL。打开失败、被重定向走，或气泡数达到 20，会把旧 id 记到 `prior_session_id` 并新建。账号禁用、重新导入 cookie、或会话认证失败时，该账号下的条目全部标 `stale`（session 不能换号接着用）。
+
+配置映射（把 `example_acc_ops` 换成账号池里的真实 id）：
+
+```bash
+python tools/sidechat_ledger.py map ops example_acc_ops
+python tools/sidechat_ledger.py list
+python tools/sidechat_ledger.py cleanup          # 7 天未用，或同一账号非 pin 超过 20 条 → stale
+python tools/sidechat_ledger.py stale role:ops   # 手工标 stale
+```
+
+管理接口（Bearer 鉴权，只读列表，不返回 cookie）：
+
+- `GET /admin/sidechats`
+- `POST /admin/sidechats/cleanup`
+- `POST /admin/sidechats/stale`，body `{"ledger_key": "role:ops"}`
+
+清理**只改台账**，不会调用 Muse `session.delete`。标成 `stale` 或策略 A 留下的旁聊，需要在 Muse 侧栏手工删；自动点删留到后续。新建成功后会尝试把侧栏标题改成 `ledger_key`，改名失败不影响回复。
+
+部署到现网前建议手工看这几步（本次改动不包含部署）：
+
+1. 不带 role 连续两次对话，应出现两条旁聊，第二条不接着第一条的上下文。
+2. `X-Muse-Role: ops` 连续两次，第二次打开同一个 `/thread/:id`。
+3. 同一 role 再加 `X-Muse-Project`，应是另一条旁聊；账号与 `role_account_map` 一致。
+4. 把台账里的 `session_id` 改成不存在的值，下一次应新建并回填。
+5. `GET /admin/sidechats` 能看到条目，且响应里没有 cookie。
+
 ### 2. 文生图（Image Generation）
 
 ```bash
