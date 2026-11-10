@@ -15,6 +15,9 @@ OpenAI 兼容:
   DELETE /admin/accounts/{id}
   POST   /admin/accounts/{id}/test  （真实打开 muse.ai 验证会话是否有效）
   POST   /admin/accounts/{id}/relogin
+  GET    /admin/sidechats           （旁聊台账，只读，无 cookie）
+  POST   /admin/sidechats/cleanup   （按 7 天 / 每账号 20 条标 stale，不删 Muse 线程）
+  POST   /admin/sidechats/stale     （按 ledger_key 手工标 stale）
   GET    /admin/tasks               （任务记录）
   DELETE /admin/tasks/{id}  |  POST /admin/tasks/clear
   GET    /admin/media  |  POST /admin/media/delete  |  DELETE /admin/media/{name}
@@ -56,6 +59,7 @@ from engine import (ESSENTIAL_COOKIES, MAX_REFERENCE_IMAGE_BYTES,
 from engine import MuseProxyError
 from store import Store, account_expiry, min_expiry
 from proxy import normalize_server, request_proxy_context, split_proxy_url
+from sidechat import SidechatKeyError, SidechatLedger, resolve_dimensions
 
 import sys
 log = logging.getLogger("muse2api")
@@ -87,6 +91,7 @@ app.add_middleware(CORSMiddleware,
 store = Store(CFG)
 engine = MuseEngine(CFG)
 engine.proxy_resolver = lambda aid: (store.get_account(aid) or {}).get("proxy")
+ledger = SidechatLedger(CFG.sidechat_ledger_file)
 
 
 class ConcurrencyLock:
@@ -386,12 +391,113 @@ def _renew_and_persist(acc_id: str, wake_vm: bool = True, force: bool = False) -
     return store.get_account(acc_id)
 
 
+def _sidechat_accounts() -> list[dict]:
+    """给台账挑号用的账号快照。不含 cookie。"""
+    rows = []
+    for account in store.accounts:
+        rows.append({
+            "id": account.get("id"),
+            "label": account.get("label") or "",
+            "enabled": account.get("enabled", True),
+            "ok": account.get("ok"),
+            "has_cookies": bool(account.get("cookies")),
+            "last_used": account.get("last_used") or 0,
+            "use_count": account.get("use_count") or 0,
+        })
+    return rows
+
+
+def _invalidate_sidechats(account_id: str | None, reason: str) -> None:
+    if not account_id:
+        return
+    try:
+        count = ledger.invalidate_account(account_id, reason=reason)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("sidechat invalidate failed account=%s err=%s", account_id, exc)
+        return
+    if count:
+        log.info("sidechat stale account=%s reason=%s count=%s", account_id, reason, count)
+
+
+def _chat_dimensions(req, header_role, header_project):
+    try:
+        return resolve_dimensions(
+            header_role=header_role,
+            header_project=header_project,
+            muse_role=getattr(req, "muse_role", None),
+            muse_project=getattr(req, "muse_project", None),
+            body_role=getattr(req, "role", None),
+            body_project=getattr(req, "project", None),
+            user=getattr(req, "user", None),
+        )
+    except SidechatKeyError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+def _route_chat_account(role: str | None, project: str | None):
+    """无 role/project 走策略 A（轮转账号 + 每次新旁聊）。有则按台账钉账号。"""
+    plan = None
+    if role or project:
+        plan = ledger.plan(role, project, _sidechat_accounts())
+    if plan and plan.get("strategy") == "bc" and plan.get("account_id"):
+        acc = store.pick_account(preferred_id=plan["account_id"], rotate=False)
+        if not acc:
+            raise HTTPException(400, "没有可用账号，请先在管理页面导入 cookie")
+        if acc["id"] != plan["account_id"]:
+            retired = plan.get("session_id") or plan.get("retire_session_id")
+            plan = dict(plan)
+            plan["account_id"] = acc["id"]
+            plan["account_label"] = acc.get("label") or ""
+            plan["session_id"] = None
+            plan["failover"] = True
+            plan["reason"] = "failover"
+            if retired:
+                plan["retire_session_id"] = retired
+        return acc, plan
+    acc = store.pick_account(rotate=True)
+    if not acc:
+        raise HTTPException(400, "没有可用账号，请先在管理页面导入 cookie")
+    return acc, plan
+
+
+def _commit_sidechat(plan: dict | None, state: dict, account_id: str | None) -> None:
+    if not plan or plan.get("strategy") != "bc" or not plan.get("ledger_key"):
+        return
+    if state.get("nav") not in ("new", "fresh", "resumed", "reused", "stale", "rollover") \
+            and not state.get("session_id"):
+        return
+    account = store.get_account(account_id) if account_id else None
+    try:
+        ledger.record_result(
+            ledger_key=plan["ledger_key"],
+            role=plan.get("role"),
+            project=plan.get("project"),
+            account_id=account_id,
+            account_label=(account or {}).get("label") or plan.get("account_label") or "",
+            session_id=state.get("session_id"),
+            bubble_hint=state.get("bubble_hint"),
+            renamed=bool(state.get("renamed")),
+            nav=state.get("nav"),
+            retire_session_id=plan.get("retire_session_id"),
+            failover=bool(plan.get("failover") or state.get("nav") in ("stale", "rollover")),
+        )
+        log.info(
+            "sidechat key=%s account=%s nav=%s captured=%s",
+            plan.get("ledger_key"), account_id, state.get("nav"),
+            bool(state.get("session_id")),
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("sidechat record failed key=%s err=%s", plan.get("ledger_key"), exc)
+
+
 def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                      timeout: int, account_id: str | None,
-                     chat_model: str | None = None):
+                     chat_model: str | None = None,
+                     sidechat: dict | None = None):
     """在独立线程中执行 chat_stream 并持有 GEN_LOCK，通过 Queue 往外吐。
     无论下游客户端何时断连、异常或超时，stop_event + finally 块保证 100% 立即释放 GEN_LOCK，绝不死锁。
-    若首字前遇到单账号 VM 卡死或会话异常，自动切换下一个健康账号重试一次。"""
+    若首字前遇到单账号 VM 卡死或会话异常，自动切换下一个健康账号重试一次。
+    换号时丢掉原来的 sessionId（旁聊不能跨账号续用）。"""
     import queue
     q = queue.Queue(maxsize=100)
     stop_event = threading.Event()
@@ -402,6 +508,8 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
         cur_exp = expires
         last_exc = None
         leased_id = None
+        plan = dict(sidechat) if sidechat else None
+        state: dict = {}
         try:
             for attempt in range(2):
                 if stop_event.is_set():
@@ -423,11 +531,19 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                     cur_cookies = alt["cookies"]
                     cur_exp = alt.get("cookies_exp")
                     log.info("【对话自动切号】切换到备用账号 %s (%s) 重试...", alt.get("label"), cur_id)
+                    if plan:
+                        retired = plan.get("session_id") or plan.get("retire_session_id")
+                        plan["session_id"] = None
+                        plan["failover"] = True
+                        plan["account_id"] = cur_id
+                        if retired:
+                            plan["retire_session_id"] = retired
                 elif cur_id:
                     ACCOUNT_POOL.acquire(account_id=cur_id, timeout=timeout)
                     leased_id = cur_id
 
                 yielded = False
+                state.clear()
                 try:
                     if cur_id:
                         _bind_account_proxy(store.get_account(cur_id) or {})
@@ -443,24 +559,31 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                             cur_cookies, prompt, cur_exp, timeout,
                             account_id=cur_id, stop_event=stop_event,
                             chat_model=chat_model,
+                            session_id=(plan or {}).get("session_id"),
+                            sidechat_label=(plan or {}).get("label"),
+                            sidechat_state=state if plan else None,
                         ):
                             yielded = True
                             q.put(("data", chunk))
                             if stop_event.is_set():
+                                _commit_sidechat(plan, state, cur_id)
                                 return
                     if cur_id:
                         store.mark(cur_id, True, "")
                         _sync_cookies(cur_id)
+                    _commit_sidechat(plan, state, cur_id)
                     return
                 except MuseAuthError as exc:
                     last_exc = exc
                     if cur_id:
                         store.mark(cur_id, False, str(exc))
+                        _invalidate_sidechats(cur_id, "auth")
                     engine.close_current_page()
                     if yielded:
                         break
                 except Exception as exc:
                     last_exc = exc
+                    _commit_sidechat(plan, state, cur_id)
                     try:
                         engine.reset_thread()
                     except Exception:
@@ -553,6 +676,12 @@ class ChatRequest(BaseModel):
     tool_choice: object | None = None
     response_format: object | None = None
     stream_options: object | None = None
+    # 旁聊台账。也可改用请求头 X-Muse-Role / X-Muse-Project，见 README。
+    user: str | None = None
+    muse_role: str | None = None
+    muse_project: str | None = None
+    role: str | None = None
+    project: str | None = None
 
 
 class ResponsesRequest(BaseModel):
@@ -565,6 +694,11 @@ class ResponsesRequest(BaseModel):
     timeout: int | None = None
     tools: list | None = None
     store: bool | None = None
+    user: str | None = None
+    muse_role: str | None = None
+    muse_project: str | None = None
+    role: str | None = None
+    project: str | None = None
 
 
 class AccountProxy(BaseModel):
@@ -1193,6 +1327,7 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
             except MuseAuthError as exc:
                 last_exc = exc
                 store.mark(cur_acc["id"], False, str(exc))
+                _invalidate_sidechats(cur_acc["id"], "auth")
                 engine.close_current_page()
             except MuseProxyError as exc:
                 last_exc = exc
@@ -1580,7 +1715,12 @@ _SSE_HEADERS = {
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(req: ChatRequest, _=Depends(auth)):
+async def chat_completions(
+    req: ChatRequest,
+    _=Depends(auth),
+    x_muse_role: str | None = Header(default=None),
+    x_muse_project: str | None = Header(default=None),
+):
     """OpenAI 兼容的对话接口 —— 各类智能体客户端都能接。
 
     说明：muse.ai 网页对话在内容出来后可选卡「智能路由 / Wonder / Ember」。
@@ -1592,6 +1732,10 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
     `tool_calls`（muse.ai 没有原生 function calling，这层属于协议适配）。
 
     对话与生图/生视频共用同一个浏览器实例，靠 `GEN_LOCK` 串行。
+
+    旁聊：请求头 `X-Muse-Role` / `X-Muse-Project`，或 body 的
+    `muse_role` / `muse_project`（也接受 `role` / `project`，以及
+    `user=role:<slug>[:proj:<slug>]`）。都没有则每次新开 /thread/new。
     """
     prompt = build_chat_prompt(req.messages) or (req.prompt or "").strip()
     if not prompt:
@@ -1607,9 +1751,8 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
 
     model = resolve_model(req.model, default="muse-spark")
     timeout = int(req.timeout or CFG.chat_timeout)
-    acc = store.pick_account(rotate=True)
-    if not acc:
-        raise HTTPException(400, "没有可用账号，请先在管理页面导入 cookie")
+    role, project = _chat_dimensions(req, x_muse_role, x_muse_project)
+    acc, sidechat = _route_chat_account(role, project)
 
     cid = "chatcmpl-" + uuid.uuid4().hex[:24]
     created = int(time.time())
@@ -1632,7 +1775,9 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
                 # 握手建立瞬间立即发送 role: assistant 首包，让下游客户端秒级捕获光标
                 yield _sse(_chat_chunk(cid, created, model, {"role": "assistant"}))
 
-                stream_gen = safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id, chat_model=model)
+                stream_gen = safe_chat_stream(
+                    cookies, prompt, expires, timeout, account_id=acc_id,
+                    chat_model=model, sidechat=sidechat)
                 if not tool_note:
                     for chunk in stream_gen:
                         for piece in _pace_text(chunk):
@@ -1694,7 +1839,9 @@ async def chat_completions(req: ChatRequest, _=Depends(auth)):
         return StreamingResponse(sync_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
     def run() -> str:
-        return "".join(safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id, chat_model=model))
+        return "".join(safe_chat_stream(
+            cookies, prompt, expires, timeout, account_id=acc_id,
+            chat_model=model, sidechat=sidechat))
 
     try:
         text = await asyncio.to_thread(run)
@@ -1757,7 +1904,12 @@ def _sse_event(event: str, data: dict) -> str:
 
 
 @app.post("/v1/responses")
-async def responses_api(req: ResponsesRequest, _=Depends(auth)):
+async def responses_api(
+    req: ResponsesRequest,
+    _=Depends(auth),
+    x_muse_role: str | None = Header(default=None),
+    x_muse_project: str | None = Header(default=None),
+):
     """OpenAI Responses API —— 新版 Codex 默认走这个端点。
 
     只实现 Codex 实际用到的子集：文本进 → 文本出（含流式事件）。
@@ -1769,9 +1921,8 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
 
     model = resolve_model(req.model, default="muse-spark")
     timeout = int(req.timeout or CFG.chat_timeout)
-    acc = store.pick_account(rotate=True)
-    if not acc:
-        raise HTTPException(400, "没有可用账号，请先在管理页面导入 cookie")
+    role, project = _chat_dimensions(req, x_muse_role, x_muse_project)
+    acc, sidechat = _route_chat_account(role, project)
 
     rid = "resp_" + uuid.uuid4().hex[:24]
     mid = "msg_" + uuid.uuid4().hex[:24]
@@ -1805,7 +1956,9 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
                     "part": {"type": "output_text", "text": "",
                              "annotations": []}})
                 full = ""
-                for chunk in safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id, chat_model=model):
+                for chunk in safe_chat_stream(
+                        cookies, prompt, expires, timeout, account_id=acc_id,
+                        chat_model=model, sidechat=sidechat):
                     full += chunk
                     yield _sse_event("response.output_text.delta", {
                         "type": "response.output_text.delta", "item_id": mid,
@@ -1830,7 +1983,9 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
         return StreamingResponse(sync_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
     def run() -> str:
-        return "".join(safe_chat_stream(cookies, prompt, expires, timeout, account_id=acc_id, chat_model=model))
+        return "".join(safe_chat_stream(
+            cookies, prompt, expires, timeout, account_id=acc_id,
+            chat_model=model, sidechat=sidechat))
 
     try:
         text = await asyncio.to_thread(run)
@@ -1850,6 +2005,29 @@ def get_media(name: str):
     if not os.path.isfile(p):
         raise HTTPException(404, "文件不存在")
     return FileResponse(p)
+
+
+# ------------------------- 管理：旁聊台账 -------------------------
+@app.get("/admin/sidechats")
+def admin_sidechats(_=Depends(auth)):
+    """只读台账。不含 cookie。session.delete 不在这里调用。"""
+    return ledger.snapshot()
+
+
+@app.post("/admin/sidechats/cleanup")
+def admin_sidechat_cleanup(_=Depends(auth)):
+    """超过 7 天，或同一账号非 pin 条目超过 20 条时标 stale。不删除 Muse 侧栏线程。"""
+    return ledger.cleanup()
+
+
+@app.post("/admin/sidechats/stale")
+def admin_sidechat_stale(payload: dict = Body(default={}), _=Depends(auth)):
+    key = str((payload or {}).get("ledger_key") or "").strip()
+    if not key:
+        raise HTTPException(400, "缺少 ledger_key")
+    if not ledger.mark_stale_key(key, reason=str((payload or {}).get("reason") or "manual")):
+        raise HTTPException(404, "台账里没有这个 ledger_key")
+    return {"ok": True, "ledger_key": key, "status": "stale", "deleted_remote": False}
 
 
 # ------------------------- 管理：总览 -------------------------
@@ -1953,6 +2131,8 @@ def patch_account(aid: str, req: AccountPatch, _=Depends(auth)):
                 engine._last_http_renew.pop(aid, None)
             _PROXY_TEST_RECEIPTS.pop(aid, None)
         acc = store.update_account(aid, **changes)
+        if req.enabled is False:
+            _invalidate_sidechats(aid, "disabled")
         return store.public_account(acc)
 
 
@@ -2012,6 +2192,7 @@ def del_account(aid: str, _=Depends(auth)):
         raise HTTPException(404, "账号不存在")
     with ACCOUNT_POOL.cond:
         _PROXY_TEST_RECEIPTS.pop(aid, None)
+    _invalidate_sidechats(aid, "deleted")
     return {"deleted": True, "id": aid}
 
 
@@ -2049,6 +2230,7 @@ async def test_account(aid: str, _=Depends(auth)):
                         "quota_error": quota_error}
             except MuseAuthError as exc:
                 store.mark(aid, False, str(exc)[:200])
+                _invalidate_sidechats(aid, "auth")
                 return {"ok": False, "message": str(exc)[:200]}
             except Exception as exc:  # noqa: BLE001
                 store.touch_keepalive(aid, None, f"测试未确认（保留账号状态）: {str(exc)[:200]}")
@@ -2083,6 +2265,7 @@ def update_cookies(aid: str, payload: dict = Body(...), _=Depends(auth)):
                                cookies_exp=exp or None)
     if not acc:
         raise HTTPException(404, "账号不存在")
+    _invalidate_sidechats(aid, "cookies_replaced")
     return {"ok": True, "id": aid, "cookie_count": len(cookies),
             "expires_at": acc.get("expires_at")}
 
@@ -2406,6 +2589,7 @@ def _probe_account_sync(aid: str, check_quota: bool = False) -> dict:
         return {"ok": False, "id": aid, "busy": exc.status_code == 409, "error": str(exc.detail)}
     except MuseAuthError as exc:
         store.touch_keepalive(aid, False, f"保活认证失败: {str(exc)[:200]}")
+        _invalidate_sidechats(aid, "auth")
         return {"ok": False, "id": aid, "error": str(exc)}
     except Exception as exc:
         store.touch_keepalive(aid, None, f"保活未确认（保留账号状态）: {str(exc)[:200]}")

@@ -35,6 +35,7 @@ import unicodedata
 
 from cdp import CDP, http_json
 from proxy import HTTPProxyRelay, request_proxy_context
+from sidechat import BUBBLE_ROLLOVER, session_id_from_path, thread_url
 
 log = logging.getLogger("muse2api")
 
@@ -701,12 +702,132 @@ class MuseEngine:
             time.sleep(0.1)
         return False
 
-    def reset_thread(self, for_chat: bool = False):
-        """关闭残留弹窗并确保处于干净会话且 WebSocket 已就绪。
-        对于纯文本对话（for_chat=True），若当前热页面无附件、无卡死且气泡数较少，直接复用现有热连接以实现 2s 级秒回。"""
-        if not self.page:
-            return
+    _CHAT_BLOCKED_JS = r"""(function(){
+        /*m2a-blocked*/
+        var d = document.querySelector('[role="dialog"]');
+        if (d) {
+            var b = d.querySelector('button[aria-label*="close" i], button');
+            if (b) b.click();
+        }
+        var hasAtts = document.querySelectorAll('[data-testid^="hatch-chat-attachment-presentation-"]').length > 0;
+        var hasStop = !!(document.querySelector('[data-testid="hatch-composer-stop-button"]')
+            || document.querySelector('button[aria-label*="Stop" i]')
+            || document.querySelector('button[aria-label*="停止"]'));
+        var bodyTxt = document.body ? (document.body.innerText || '') : '';
+        var hasStuck = bodyTxt.indexOf('Still sending') !== -1 || bodyTxt.indexOf('Connecting...') !== -1;
+        return !!(hasStop || hasStuck || hasAtts);
+    })()"""
+
+    _CHAT_BUBBLES_JS = r"""(function(){
+        /*m2a-bubbles*/
+        var scope = document.querySelector('main,[class*="chat-scroll"],[class*="hatch-chat-scroll"]') || document.body;
+        return scope ? scope.querySelectorAll('div[class*="hatch-chat-groupable-bubble"]').length : 0;
+    })()"""
+
+    _CHAT_READY_JS = r"""(function(){
+        /*m2a-composer-ready*/
+        return document.readyState === 'complete' && !!document.querySelector('textarea');
+    })()"""
+
+    def _page_pathname(self) -> str:
         try:
+            return str(self.page.js("/*m2a-path*/window.location.pathname") or "")
+        except Exception:
+            return ""
+
+    def _chat_blocked(self) -> bool:
+        try:
+            return bool(self.page.js(self._CHAT_BLOCKED_JS))
+        except Exception:
+            return True
+
+    def _chat_bubbles(self) -> int:
+        try:
+            return int(self.page.js(self._CHAT_BUBBLES_JS) or 0)
+        except Exception:
+            return 0
+
+    def _composer_ready(self) -> bool:
+        try:
+            return bool(self.page.js(self._CHAT_READY_JS))
+        except Exception:
+            return False
+
+    def _navigate(self, url: str):
+        self.page.send("Page.navigate", {"url": url})
+
+    def _wait_open_thread(self, expect_id: str | None = None, *, empty: bool = False,
+                          timeout: float = 10.0) -> bool:
+        """等目标旁聊出现输入框。expect_id 不匹配且已离开该线程则视为失败。"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            time.sleep(0.08)
+            path = self._page_pathname()
+            sid = session_id_from_path(path)
+            if not self._composer_ready():
+                continue
+            if expect_id:
+                if sid == expect_id:
+                    self._wait_ws_ready(self.page, timeout=8.0)
+                    return True
+                bare = path.rstrip("/") or "/"
+                if bare in ("/", "/thread/new", "/thread/main") or path.startswith("/thread/new"):
+                    return False
+                continue
+            if empty and self._chat_bubbles() == 0:
+                self._wait_ws_ready(self.page, timeout=8.0)
+                return True
+        return False
+
+    def _open_new_thread(self) -> None:
+        self._navigate("https://muse.ai/thread/new")
+        self._wait_open_thread(empty=True, timeout=10.0)
+
+    def _reset_chat_thread(self, session_id: str | None) -> str:
+        """对话线程。
+
+        有 session_id：热页已是这条旁聊则接着聊；否则打开 /thread/{id}。
+        打开失败、被重定向走、或气泡数达到归档线时改走 /thread/new。
+        没有 session_id（策略 A）：只要当前不是空白草稿就强制 /thread/new。
+        不再因为气泡 <24 就复用上一条无关旁聊。空白 /thread/new 不重复导航。
+        """
+        target = session_id if session_id and session_id_from_path("/thread/" + session_id) else None
+        blocked = self._chat_blocked()
+        path = self._page_pathname()
+        current = session_id_from_path(path)
+        on_draft = path.rstrip("/").endswith("/thread/new")
+        if target and current == target and not blocked:
+            if self._chat_bubbles() >= BUBBLE_ROLLOVER:
+                self._open_new_thread()
+                return "rollover"
+            self._wait_ws_ready(self.page, timeout=8.0)
+            return "reused"
+        if target:
+            self._navigate(thread_url(target))
+            if self._wait_open_thread(expect_id=target):
+                if self._chat_bubbles() >= BUBBLE_ROLLOVER:
+                    self._open_new_thread()
+                    return "rollover"
+                return "resumed"
+            self._open_new_thread()
+            return "stale"
+        if (not blocked) and on_draft and self._chat_bubbles() == 0:
+            self._wait_ws_ready(self.page, timeout=8.0)
+            return "fresh"
+        self._open_new_thread()
+        return "new"
+
+    def reset_thread(self, for_chat: bool = False, session_id: str | None = None) -> str:
+        """关闭残留弹窗并准备会话页。
+
+        生图/生视频仍走原来的规则：不在 /thread/new，或已有气泡，或卡住/有附件，才新开。
+        纯文本对话见 `_reset_chat_thread`。
+        """
+        if not self.page:
+            return "skipped"
+        try:
+            if for_chat:
+                return self._reset_chat_thread(session_id)
             needs_nav = self.page.js("""(function(forChat){
                 var d = document.querySelector('[role="dialog"]');
                 if (d) {
@@ -728,20 +849,96 @@ class MuseEngine:
                 return (window.location.pathname !== '/thread/new') || bubbleCount > 0;
             })(%s)""" % ("true" if for_chat else "false"))
             if needs_nav:
-                self.page.send("Page.navigate", {"url": "https://muse.ai/thread/new"})
-                t_end = time.time() + 10.0
-                while time.time() < t_end:
-                    time.sleep(0.08)
-                    ready = self.page.js("""(function(){
-                        return document.readyState === 'complete'
-                            && !!document.querySelector('textarea')
-                            && document.querySelectorAll('div[class*="hatch-chat-groupable-bubble"]').length === 0;
-                    })()""")
-                    if ready:
-                        break
-                self._wait_ws_ready(self.page, timeout=12.0)
+                self._open_new_thread()
+                return "new"
+            return "kept"
         except Exception:
-            pass
+            log.debug("reset_thread failed", exc_info=True)
+            return "error"
+
+    _RENAME_SIDECHAT_JS = r"""(function(sessionId, label){
+        var href = '/thread/' + sessionId;
+        var nodes = [].slice.call(document.querySelectorAll('a,[role="option"],[role="menuitem"],button,div'));
+        var row = null;
+        for (var i = 0; i < nodes.length; i++) {
+            var el = nodes[i];
+            var h = (el.getAttribute && el.getAttribute('href')) || '';
+            var sid = el.getAttribute && (el.getAttribute('data-session-id') || el.getAttribute('data-side-chat-id') || '');
+            if ((h && h.indexOf(href) !== -1) || sid === sessionId) {
+                row = el.closest('li,[role="option"],[role="menuitem"],a') || el;
+                break;
+            }
+        }
+        if (!row) return 'no-row';
+        var btn = [].slice.call(row.querySelectorAll('button,[role="button"]')).find(function(b){
+            var al = ((b.getAttribute('aria-label') || '') + ' ' + (b.innerText || ''));
+            return /rename|重命名/i.test(al);
+        });
+        if (!btn) return 'no-rename';
+        btn.click();
+        var dlg = document.querySelector('[role="dialog"] input, [role="dialog"] textarea');
+        if (!dlg) return 'no-input';
+        var proto = dlg.tagName === 'TEXTAREA'
+            ? Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')
+            : Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+        if (proto && proto.set) proto.set.call(dlg, label);
+        else dlg.value = label;
+        dlg.dispatchEvent(new Event('input', {bubbles:true}));
+        var ok = [].slice.call(document.querySelectorAll('[role="dialog"] button')).find(function(b){
+            var al = ((b.getAttribute('aria-label') || '') + ' ' + (b.innerText || ''));
+            return /^(save|rename|ok|done|保存|重命名|确定)$/i.test((b.innerText || '').trim())
+                || /save|rename|保存|确定/i.test(al);
+        });
+        if (ok) ok.click();
+        return 'ok';
+    })(%s, %s)"""
+
+    def _rename_sidechat(self, label: str, session_id: str) -> bool:
+        """尽力把新建旁聊改名为 ledger_key。失败不影响对话。不碰主输入框。"""
+        if not self.page or not label or not session_id:
+            return False
+        try:
+            self.page.js("""(function(){
+                var t = document.querySelector('[data-testid="hatch-chat-switcher-trigger"]');
+                if (t) t.click();
+                return true;
+            })()""")
+        except Exception as exc:  # noqa: BLE001
+            log.info("sidechat rename skipped label=%s err=%s", label, exc)
+            return False
+        deadline = time.time() + 1.2
+        last = "no-row"
+        while time.time() < deadline:
+            time.sleep(0.15)
+            try:
+                last = self.page.js(self._RENAME_SIDECHAT_JS % (
+                    json.dumps(session_id), json.dumps(label)))
+            except Exception as exc:  # noqa: BLE001
+                log.info("sidechat rename skipped label=%s err=%s", label, exc)
+                return False
+            if last == "ok":
+                log.info("sidechat renamed label=%s", label)
+                return True
+            if last in ("no-rename", "no-input"):
+                break
+        log.info("sidechat rename skipped label=%s result=%s", label, last)
+        return False
+
+    def _publish_sidechat(self, state: dict | None, label: str | None,
+                          resumed_id: str | None, nav: str) -> None:
+        if state is None:
+            return
+        state["nav"] = nav
+        state["stale"] = nav in ("stale", "rollover")
+        if not self.page:
+            return
+        path = self._page_pathname()
+        sid = session_id_from_path(path)
+        state["path"] = path
+        state["session_id"] = sid
+        state["bubble_hint"] = self._chat_bubbles()
+        created = bool(sid) and sid != resumed_id and nav in ("new", "fresh", "stale", "rollover")
+        state["renamed"] = bool(self._rename_sidechat(label, sid)) if label and created else False
 
     def ensure_page(self, cookies: dict, expires: dict | None = None, account_id: str | None = None):
         resolver = getattr(self, "proxy_resolver", None)
@@ -1621,73 +1818,89 @@ class MuseEngine:
 
     def chat_stream(self, cookies: dict, prompt: str, expires: dict | None = None,
                     timeout: int | None = None, account_id: str | None = None,
-                    stop_event=None, chat_model: str | None = None):
-        """发一条消息，流式 yield 增量文本。"""
+                    stop_event=None, chat_model: str | None = None,
+                    session_id: str | None = None, sidechat_label: str | None = None,
+                    sidechat_state: dict | None = None):
+        """发一条消息，流式 yield 增量文本。
+
+        session_id 有值时续用该旁聊；没有则策略 A，新开 /thread/new。
+        结束后把 pathname 里的 sessionId 写进 sidechat_state（若调用方传入）。
+        """
         timeout = int(timeout or getattr(self.cfg, "chat_timeout", 300))
-        self.ensure_page(cookies, expires, account_id=account_id)
-        self.reset_thread(for_chat=True)
-        self._ensure_chat_model(chat_model, stop_event=stop_event)
-        base_agent, base_text, _ = self._poll_chat()
-        self._send(prompt)
+        nav = "skipped"
+        resumed_id = None
+        try:
+            self.ensure_page(cookies, expires, account_id=account_id)
+            nav = self.reset_thread(for_chat=True, session_id=session_id)
+            if nav in ("resumed", "reused"):
+                resumed_id = session_id
+            self._ensure_chat_model(chat_model, stop_event=stop_event)
+            base_agent, base_text, _ = self._poll_chat()
+            self._send(prompt)
 
-        t_sent = time.time()
-        deadline = t_sent + timeout
-        first_token_deadline = min(deadline, t_sent + 40.0)
-        sent, last, stable = "", None, 0
-        got_first = False
+            t_sent = time.time()
+            deadline = t_sent + timeout
+            first_token_deadline = min(deadline, t_sent + 40.0)
+            sent, last, stable = "", None, 0
+            got_first = False
 
-        # 1. 等待助手生成并开始吐字（高频 60ms 采样，捕获到首批增量文字瞬间 yield 出去）
-        while time.time() < first_token_deadline:
-            if stop_event is not None and stop_event.is_set():
-                return
-            time.sleep(0.06)
-            cnt, cur, has_stop = self._poll_chat()
-            if not cur or (cnt <= base_agent and cur == base_text):
-                if time.time() - t_sent > 14.0:
-                    try:
-                        tail = self.page.js("document.body.innerText.slice(-500)") or ""
-                    except Exception:
-                        tail = ""
-                    if "Still sending" in tail or "Connecting..." in tail:
-                        raise MuseGenerationError("云端 VM 连接超时 (Still sending)")
-                continue
+            # 1. 等待助手生成并开始吐字（高频 60ms 采样，捕获到首批增量文字瞬间 yield 出去）
+            while time.time() < first_token_deadline:
+                if stop_event is not None and stop_event.is_set():
+                    return
+                time.sleep(0.06)
+                cnt, cur, has_stop = self._poll_chat()
+                if not cur or (cnt <= base_agent and cur == base_text):
+                    if time.time() - t_sent > 14.0:
+                        try:
+                            tail = self.page.js("document.body.innerText.slice(-500)") or ""
+                        except Exception:
+                            tail = ""
+                        if "Still sending" in tail or "Connecting..." in tail:
+                            raise MuseGenerationError("云端 VM 连接超时 (Still sending)")
+                    continue
 
-            delta = cur[len(sent):] if cur.startswith(sent) else cur
-            if delta:
-                sent = cur
-                yield delta
-                last = cur
-                got_first = True
-                break
-
-        if not got_first:
-            raise MuseGenerationError("等待助手首字响应超时")
-
-        # 2. 持续捕获增量文本
-        while time.time() < deadline:
-            if stop_event is not None and stop_event.is_set():
-                return
-            time.sleep(0.06)
-            cnt, cur, has_stop = self._poll_chat()
-            if not cur:
-                continue
-
-            if cur != last:
                 delta = cur[len(sent):] if cur.startswith(sent) else cur
                 if delta:
                     sent = cur
                     yield delta
-                last, stable = cur, 0
-            else:
-                stable += 1
-                # Stop 按钮消失说明前端生成彻底结束，连续 3 次（约 0.18s）无新文本即正常退出
-                if not has_stop and stable >= 3:
-                    return
-                # Stop 按钮仍在时绝不过早截断（模型思考、代码块或网络抖动），允许等待至 stable >= 80（约 5s）防卡死
-                if has_stop and stable >= 80:
-                    return
+                    last = cur
+                    got_first = True
+                    break
 
-        raise MuseGenerationError("等待助手回复超时")
+            if not got_first:
+                raise MuseGenerationError("等待助手首字响应超时")
+
+            # 2. 持续捕获增量文本
+            while time.time() < deadline:
+                if stop_event is not None and stop_event.is_set():
+                    return
+                time.sleep(0.06)
+                cnt, cur, has_stop = self._poll_chat()
+                if not cur:
+                    continue
+
+                if cur != last:
+                    delta = cur[len(sent):] if cur.startswith(sent) else cur
+                    if delta:
+                        sent = cur
+                        yield delta
+                    last, stable = cur, 0
+                else:
+                    stable += 1
+                    # Stop 按钮消失说明前端生成彻底结束，连续 3 次（约 0.18s）无新文本即正常退出
+                    if not has_stop and stable >= 3:
+                        return
+                    # Stop 按钮仍在时绝不过早截断（模型思考、代码块或网络抖动），允许等待至 stable >= 80（约 5s）防卡死
+                    if has_stop and stable >= 80:
+                        return
+
+            raise MuseGenerationError("等待助手回复超时")
+        finally:
+            try:
+                self._publish_sidechat(sidechat_state, sidechat_label, resumed_id, nav)
+            except Exception:
+                log.info("sidechat capture failed", exc_info=True)
 
     def chat(self, cookies: dict, prompt: str, expires: dict | None = None,
              timeout: int | None = None, account_id: str | None = None,

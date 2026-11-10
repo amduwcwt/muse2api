@@ -147,6 +147,11 @@ class Config:
         return os.path.join(self.data_dir, "accounts.json")
 
     @property
+    def sidechat_ledger_file(self) -> str:
+        """运行时旁聊台账，与 accounts.json 同目录，随数据卷持久化。"""
+        return os.path.join(self.data_dir, "sidechat_ledger.json")
+
+    @property
     def tasks_file(self) -> str:
         return os.path.join(self.data_dir, "tasks.json")
 
