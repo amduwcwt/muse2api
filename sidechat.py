@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import os
 import re
 import threading
 import time
@@ -194,8 +195,26 @@ class SidechatLedger:
     def __init__(self, path: str):
         self.path = path
         self._lock = _lock_for(path)
+        self._disk_sig = None
         with self._lock:
             self.data = self._load()
+            self._disk_sig = self._stat_sig()
+
+    def _stat_sig(self):
+        """文件身份。外部 CLI 改盘后靠它发现，不必重启进程。"""
+        try:
+            st = os.stat(self.path)
+        except OSError:
+            return None
+        return (getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)), st.st_size)
+
+    def _reload_if_disk_changed(self):
+        """在 self._lock 内调用。CLI 的 map/cleanup 和本进程不是同一份内存。"""
+        sig = self._stat_sig()
+        if sig == self._disk_sig:
+            return
+        self.data = self._load()
+        self._disk_sig = self._stat_sig()
 
     def _load(self) -> dict:
         raw = _read(self.path, None)
@@ -215,9 +234,11 @@ class SidechatLedger:
         self.data["updated_at"] = int(time.time())
         self.data = _scrub(self.data)
         _write(self.path, self.data)
+        self._disk_sig = self._stat_sig()
 
     def snapshot(self) -> dict:
         with self._lock:
+            self._reload_if_disk_changed()
             return _scrub({
                 "version": self.data.get("version", LEDGER_VERSION),
                 "updated_at": self.data.get("updated_at"),
@@ -278,6 +299,7 @@ class SidechatLedger:
             "retire_session_id": None,
         }
         with self._lock:
+            self._reload_if_disk_changed()
             entry = self._find(key)
             mapped = self._mapped_account(role)
         entry_id = (entry or {}).get("muse_account_id")
@@ -355,6 +377,7 @@ class SidechatLedger:
             session_id = None
         now = int(time.time())
         with self._lock:
+            self._reload_if_disk_changed()
             entry = self._find(ledger_key)
             if entry is None:
                 entry = {
@@ -413,6 +436,7 @@ class SidechatLedger:
         now = int(time.time())
         changed = 0
         with self._lock:
+            self._reload_if_disk_changed()
             for entry in self.data.get("entries") or []:
                 if entry.get("muse_account_id") != account_id:
                     continue
@@ -428,6 +452,7 @@ class SidechatLedger:
 
     def mark_stale_key(self, key: str, reason: str = "manual") -> bool:
         with self._lock:
+            self._reload_if_disk_changed()
             entry = self._find(key)
             if not entry:
                 return False
@@ -443,6 +468,7 @@ class SidechatLedger:
         if not slug:
             raise SidechatKeyError("role 不能为空")
         with self._lock:
+            self._reload_if_disk_changed()
             role_map = self.data.setdefault("role_account_map", {})
             if account_id is None or (isinstance(account_id, str) and not account_id.strip()):
                 role_map.pop(slug, None)
@@ -463,6 +489,7 @@ class SidechatLedger:
         now_ts = int(now if now is not None else time.time())
         marked: list[str] = []
         with self._lock:
+            self._reload_if_disk_changed()
             for entry in self.data.get("entries") or []:
                 if entry.get("pin") or entry.get("status") not in ("active", "pending"):
                     continue
