@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 import threading
 import time
@@ -71,6 +72,44 @@ def account_expiry(cookies_exp: dict | None,
     if base_ts:
         return int(base_ts) + VML_TTL
     return min_expiry(ce)
+
+
+def quota_exhausted(quota) -> bool:
+    """额度缓存是否明确耗尽。读失败或 found 不为真时不当作耗尽。"""
+    if not isinstance(quota, dict) or not quota.get("found"):
+        return False
+    if quota.get("exhausted") is True:
+        return True
+    blob = "\n".join(
+        str(quota.get(key) or "") for key in ("raw", "extra_left", "note")
+    )
+    if re.search(
+        r"limit\s+reached|out of (?:tokens|quota)|quota exceeded|"
+        r"额度(?:已)?(?:用尽|耗尽|用完)|没有剩余额度",
+        blob,
+        re.I,
+    ):
+        return True
+    if re.search(r"(?:^|\s)0(?:\.0+)?\s*(?:tokens?|B)\s*left\b", blob, re.I):
+        return True
+    def as_float(value):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+    weekly = as_float(quota.get("weekly_used_pct")) if quota.get("weekly_used_pct") is not None else None
+    extra_pct = as_float(quota.get("extra_used_pct")) if quota.get("extra_used_pct") is not None else None
+    extra_left = quota.get("extra_left")
+    extra_positive = isinstance(extra_left, str) and re.search(r"[1-9]", extra_left)
+    if weekly is not None and weekly >= 100:
+        if extra_positive and (extra_pct is None or extra_pct < 100):
+            return False
+        if extra_pct is not None and extra_pct < 100:
+            return False
+        return True
+    if extra_pct is not None and extra_pct >= 100 and (weekly is None or weekly >= 100):
+        return True
+    return False
 
 
 def _read(path: str, default):
@@ -224,6 +263,89 @@ class Store:
                     a["checked_at"] = int(time.time())
             _write(self.cfg.accounts_file, self.accounts)
 
+    @staticmethod
+    def _failover_view(account: dict) -> dict:
+        raw = account.get("failover") if isinstance(account.get("failover"), dict) else {}
+        try:
+            cooldown_until = int(raw.get("cooldown_until") or 0)
+        except (TypeError, ValueError):
+            cooldown_until = 0
+        try:
+            fail_count = int(raw.get("fail_count") or 0)
+        except (TypeError, ValueError):
+            fail_count = 0
+        reason = raw.get("last_fail_reason")
+        return {
+            "cooldown_until": cooldown_until,
+            "fail_count": fail_count,
+            "last_fail_reason": reason if isinstance(reason, str) and reason else None,
+            "last_fail_at": raw.get("last_fail_at"),
+            "no_picker": bool(raw.get("no_picker")),
+        }
+
+    def note_account_failure(self, aid: str, reason: str, *,
+                             cooldown_seconds: int = 0,
+                             no_picker: bool | None = None,
+                             now: float | None = None) -> dict | None:
+        """写入账号 failover 健康字段。不改 cookie。"""
+        now_ts = int(now if now is not None else time.time())
+        reason = (reason or "fail")[:64]
+        with _LOCK:
+            for account in self.accounts:
+                if account["id"] != aid:
+                    continue
+                fo = self._failover_view(account)
+                same_open = (
+                    fo["last_fail_reason"] == reason
+                    and fo["cooldown_until"] > now_ts
+                    and reason != "no_picker"
+                )
+                if not same_open:
+                    fo["fail_count"] = fo["fail_count"] + 1
+                fo["last_fail_reason"] = reason
+                fo["last_fail_at"] = now_ts
+                if cooldown_seconds and cooldown_seconds > 0:
+                    fo["cooldown_until"] = max(
+                        fo["cooldown_until"], now_ts + int(cooldown_seconds))
+                if no_picker is True or reason == "no_picker":
+                    fo["no_picker"] = True
+                elif no_picker is False:
+                    fo["no_picker"] = False
+                account["failover"] = fo
+                _write(self.cfg.accounts_file, self.accounts)
+                return dict(fo)
+        return None
+
+    def note_account_success(self, aid: str) -> dict | None:
+        """成功一次：fail_count 归零，并清掉非额度冷却。no_picker 保持到手动清除或探测到选卡。"""
+        with _LOCK:
+            for account in self.accounts:
+                if account["id"] != aid:
+                    continue
+                raw = account.get("failover")
+                if not isinstance(raw, dict):
+                    return None
+                fo = self._failover_view(account)
+                fo["fail_count"] = 0
+                if fo.get("last_fail_reason") != "quota":
+                    fo["cooldown_until"] = 0
+                account["failover"] = fo
+                _write(self.cfg.accounts_file, self.accounts)
+                return dict(fo)
+        return None
+
+    def clear_no_picker(self, aid: str) -> bool:
+        with _LOCK:
+            for account in self.accounts:
+                if account["id"] != aid:
+                    continue
+                fo = self._failover_view(account)
+                fo["no_picker"] = False
+                account["failover"] = fo
+                _write(self.cfg.accounts_file, self.accounts)
+                return True
+        return False
+
     def get_account(self, aid: str) -> dict | None:
         for a in self.accounts:
             if a["id"] == aid:
@@ -253,6 +375,15 @@ class Store:
                             a["expiry_anchor"] = int(time.time())
                         a["expires_at"] = account_expiry(
                             ce, a.get("expiry_anchor") or a.get("created_at"))
+                    if "quota" in kw and isinstance(a.get("quota"), dict):
+                        fo = a.get("failover")
+                        if (isinstance(fo, dict) and fo.get("last_fail_reason") == "quota"
+                                and not quota_exhausted(a.get("quota"))):
+                            view = self._failover_view(a)
+                            view["cooldown_until"] = 0
+                            view["fail_count"] = 0
+                            view["last_fail_reason"] = None
+                            a["failover"] = view
                     _write(self.cfg.accounts_file, self.accounts)
                     return a
         return None

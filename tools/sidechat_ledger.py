@@ -10,6 +10,8 @@
 
 map 把角色钉到账号池里的 id（与 data/accounts.json 的 id 一致）。
 账号不可用时，下一次该角色的请求会换一个可用账号并新建旁聊。
+真正切号成功后，服务也会把 role_account_map 改到新账号。
+FAILOVER_LIVE 默认关闭时，额度、无选卡、冷却和忙碌只记日志，不改映射。
 服务进程会在管理接口和下一次带 role 的对话时重新读这个文件，改映射不用重启。
 """
 from __future__ import annotations
