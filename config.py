@@ -161,4 +161,41 @@ class Config:
             os.makedirs(d, exist_ok=True)
 
 
+def _flag(primary: str, fallback: str | None = None, default: str = "0") -> bool:
+    raw = os.environ.get(primary)
+    if raw is None and fallback:
+        raw = os.environ.get(fallback)
+    if raw is None:
+        raw = default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def failover_live() -> bool:
+    """真切号开关。默认关闭：额度 / no-picker / 冷却 / 忙碌降级只记日志。
+
+    运维打开：环境变量 `FAILOVER_LIVE=1`（别名 `MUSE2API_FAILOVER_LIVE`）。
+    每次选号时读取，改环境后需重启进程。
+    """
+    return _flag("FAILOVER_LIVE", "MUSE2API_FAILOVER_LIVE", "0")
+
+
+def failover_cooldown_seconds() -> int:
+    raw = os.environ.get("FAILOVER_COOLDOWN_SECONDS", "1200")
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        value = 1200
+    return max(60, min(value, 7 * 86400))
+
+
+def failover_max_attempts() -> int:
+    """单请求最多尝试几个账号。默认 2，上限 3。仅 FAILOVER_LIVE 打开时生效。"""
+    raw = os.environ.get("FAILOVER_MAX_ATTEMPTS", "2")
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        value = 2
+    return max(1, min(value, 3))
+
+
 CFG = Config()

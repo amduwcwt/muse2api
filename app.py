@@ -51,7 +51,7 @@ from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
                                Response, StreamingResponse)
 from pydantic import model_validator, BaseModel, Field, SecretStr, field_validator
 
-from config import CFG
+from config import CFG, failover_cooldown_seconds, failover_live, failover_max_attempts
 from engine import (ESSENTIAL_COOKIES, MAX_REFERENCE_IMAGE_BYTES,
                     MAX_REFERENCE_IMAGES, MAX_REFERENCE_TOTAL_BYTES,
                     REFERENCE_MIME_EXT, MuseAuthError, MuseEngine, MuseGenerationError,
@@ -59,7 +59,10 @@ from engine import (ESSENTIAL_COOKIES, MAX_REFERENCE_IMAGE_BYTES,
 from engine import MuseProxyError
 from store import Store, account_expiry, min_expiry
 from proxy import normalize_server, request_proxy_context, split_proxy_url
-from sidechat import SidechatKeyError, SidechatLedger, resolve_dimensions
+from sidechat import (SidechatKeyError, SidechatLedger, account_health_reason,
+                      busy_degrade_decision, enforce_same_account_session,
+                      follow_role_account, resolve_dimensions,
+                      resolve_explicit_account)
 
 import sys
 log = logging.getLogger("muse2api")
@@ -142,10 +145,21 @@ class AccountPoolManager:
         self.busy_accounts: set[str] = set()
         self.cond = threading.Condition()
 
+    def _free_alternate(self, exclude: set[str], *, record_use: bool) -> dict | None:
+        """挑一个当前不忙、经典可用的号。record_use=False 时不写 last_used。"""
+        return self.store.pick_account(
+            rotate=True,
+            force_rotate=True,
+            exclude_ids=set(exclude) | set(self.busy_accounts),
+            record_use=record_use,
+        )
+
     def acquire(self, account_id: str | None = None, preferred_id: str | None = None,
                 rotate: bool = True, force_rotate: bool = False,
-                timeout: float = 60.0, record_use: bool = True) -> dict:
+                timeout: float = 60.0, record_use: bool = True,
+                allow_degrade: bool = False, failover_out: dict | None = None) -> dict:
         deadline = time.monotonic() + timeout
+        logged_busy = False
         with self.cond:
             while True:
                 remaining = deadline - time.monotonic()
@@ -159,6 +173,31 @@ class AccountPoolManager:
                     if account_id not in self.busy_accounts:
                         self.busy_accounts.add(account_id)
                         return acc
+                    if allow_degrade and not logged_busy:
+                        logged_busy = True
+                        live = failover_live()
+                        alt = self._free_alternate({account_id}, record_use=live)
+                        decision = busy_degrade_decision(
+                            busy=True,
+                            allow=True,
+                            live=live,
+                            alternate_id=(alt or {}).get("id"),
+                        )
+                        if failover_out is not None:
+                            failover_out.clear()
+                            failover_out.update(decision)
+                        if decision.get("action") == "degrade" and alt and alt.get("id") not in self.busy_accounts:
+                            self.busy_accounts.add(alt["id"])
+                            log.info(
+                                "failover_live=1 account_from=%s account_to=%s reason=busy",
+                                account_id, alt.get("id"),
+                            )
+                            return alt
+                        if decision.get("action") == "dry":
+                            log.info(
+                                "failover_would=1 account_from=%s account_to=%s reason=busy",
+                                account_id, decision.get("would_account_id"),
+                            )
                 else:
                     pref = preferred_id if preferred_id not in self.busy_accounts else None
                     acc = self.store.pick_account(
@@ -403,6 +442,8 @@ def _sidechat_accounts() -> list[dict]:
             "has_cookies": bool(account.get("cookies")),
             "last_used": account.get("last_used") or 0,
             "use_count": account.get("use_count") or 0,
+            "quota": account.get("quota") if isinstance(account.get("quota"), dict) else None,
+            "failover": account.get("failover") if isinstance(account.get("failover"), dict) else None,
         })
     return rows
 
@@ -434,39 +475,102 @@ def _chat_dimensions(req, header_role, header_project):
         raise HTTPException(400, str(exc)) from exc
 
 
-def _route_chat_account(role: str | None, project: str | None):
-    """无 role/project 走策略 A（轮转账号 + 每次新旁聊）。有则按台账钉账号。"""
+def _explicit_account(req, header_account):
+    try:
+        return resolve_explicit_account(
+            header_account=header_account,
+            muse_account=getattr(req, "muse_account", None),
+            body_account=getattr(req, "account_id", None),
+        )
+    except SidechatKeyError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+def _log_failover_would(plan: dict | None) -> None:
+    if not plan or not plan.get("would_failover"):
+        return
+    log.info(
+        "failover_would=1 account_from=%s account_to=%s reason=%s",
+        plan.get("account_from") or plan.get("account_id"),
+        plan.get("would_account_id"),
+        plan.get("would_reason"),
+    )
+
+
+def _route_chat_account(role: str | None, project: str | None, *,
+                        explicit_account: str | None = None,
+                        require_picker: bool = False):
+    """无 role/project/account 走策略 A（轮转账号 + 每次新旁聊）。
+
+    有 role 时按台账钉账号。显式 X-Muse-Account 压过映射和已有旁聊。
+    FAILOVER_LIVE 关闭时，冷却 / 额度 / no-picker 只记 would，不改实际账号。
+    """
+    if explicit_account and not store.get_account(explicit_account):
+        raise HTTPException(
+            400, f"未知账号 {explicit_account}；X-Muse-Account 必须是账号池里的 id")
     plan = None
-    if role or project:
-        plan = ledger.plan(role, project, _sidechat_accounts())
-    if plan and plan.get("strategy") == "bc" and plan.get("account_id"):
+    if role or project or explicit_account:
+        plan = ledger.plan(
+            role, project, _sidechat_accounts(),
+            explicit_account=explicit_account,
+            require_picker=require_picker,
+            live=failover_live(),
+        )
+        _log_failover_would(plan)
+        if plan.get("failover") and plan.get("reason") in ("quota", "no_picker", "cooldown"):
+            source = plan.get("account_from")
+            if source and failover_live():
+                store.note_account_failure(
+                    source,
+                    plan["reason"],
+                    cooldown_seconds=0 if plan["reason"] == "no_picker" else failover_cooldown_seconds(),
+                    no_picker=True if plan["reason"] == "no_picker" else None,
+                )
+            if plan.get("account_id"):
+                log.info(
+                    "failover_live=1 account_from=%s account_to=%s reason=%s",
+                    source, plan.get("account_id"), plan.get("reason"),
+                )
+    if plan and plan.get("account_id"):
         acc = store.pick_account(preferred_id=plan["account_id"], rotate=False)
         if not acc:
             raise HTTPException(400, "没有可用账号，请先在管理页面导入 cookie")
         if acc["id"] != plan["account_id"]:
             retired = plan.get("session_id") or plan.get("retire_session_id")
             plan = dict(plan)
+            plan["account_from"] = plan.get("account_from") or plan.get("account_id")
             plan["account_id"] = acc["id"]
             plan["account_label"] = acc.get("label") or ""
             plan["session_id"] = None
+            plan["bound_account_id"] = None
             plan["failover"] = True
-            plan["reason"] = "failover"
+            if plan.get("reason") in (None, "resume", "explicit", "role_map", "entry", "assign"):
+                plan["reason"] = "failover"
             if retired:
                 plan["retire_session_id"] = retired
+        plan = enforce_same_account_session(plan, acc["id"])
+        if plan.get("strategy") == "A" and not explicit_account:
+            return acc, None
         return acc, plan
+    if plan is not None:
+        if plan.get("reason") == "no_picker":
+            raise HTTPException(503, "池内没有可切换 Wonder/Ember 选卡的账号")
+        raise HTTPException(400, "没有可用账号，请先在管理页面导入 cookie")
     acc = store.pick_account(rotate=True)
     if not acc:
         raise HTTPException(400, "没有可用账号，请先在管理页面导入 cookie")
-    return acc, plan
+    return acc, None
 
 
-def _commit_sidechat(plan: dict | None, state: dict, account_id: str | None) -> None:
+def _commit_sidechat(plan: dict | None, state: dict, account_id: str | None,
+                     follow_map: bool = False) -> None:
     if not plan or plan.get("strategy") != "bc" or not plan.get("ledger_key"):
         return
     if state.get("nav") not in ("new", "fresh", "resumed", "reused", "stale", "rollover") \
             and not state.get("session_id"):
         return
     account = store.get_account(account_id) if account_id else None
+    plan = enforce_same_account_session(plan, account_id)
     try:
         ledger.record_result(
             ledger_key=plan["ledger_key"],
@@ -479,28 +583,166 @@ def _commit_sidechat(plan: dict | None, state: dict, account_id: str | None) -> 
             renamed=bool(state.get("renamed")),
             nav=state.get("nav"),
             retire_session_id=plan.get("retire_session_id"),
-            failover=bool(plan.get("failover") or state.get("nav") in ("stale", "rollover")),
+            failover=bool(plan.get("failover")),
+            failover_reason=plan.get("reason") if plan.get("failover") else None,
         )
+        if follow_map and follow_role_account(ledger, plan, account_id):
+            log.info(
+                "role_account_map follow role=%s account=%s reason=%s",
+                plan.get("role"), account_id, plan.get("reason"),
+            )
         log.info(
-            "sidechat key=%s account=%s nav=%s captured=%s",
+            "sidechat key=%s account=%s nav=%s captured=%s failover=%s",
             plan.get("ledger_key"), account_id, state.get("nav"),
-            bool(state.get("session_id")),
+            bool(state.get("session_id")), bool(plan.get("failover")),
         )
     except Exception as exc:  # noqa: BLE001
         log.warning("sidechat record failed key=%s err=%s", plan.get("ledger_key"), exc)
 
 
+def _header_token(value) -> str:
+    text = "" if value is None else str(value)
+    try:
+        text.encode("latin-1")
+    except UnicodeEncodeError:
+        text = text.encode("latin-1", "replace").decode("latin-1")
+    return text.replace("\n", " ").replace("\r", " ")
+
+
+def _muse_view(plan: dict | None, account: dict | None, outcome: dict | None = None) -> dict:
+    outcome = outcome or {}
+    plan = plan or {}
+    actual_id = outcome.get("account_id") or (account or {}).get("id") or plan.get("account_id") or ""
+    label = outcome.get("account_label") or (account or {}).get("label") or plan.get("account_label") or ""
+    session_id = outcome.get("session_id")
+    if session_id is None:
+        session_id = plan.get("session_id") or ""
+    failed_over = bool(outcome.get("failover") if "failover" in outcome else plan.get("failover"))
+    would = bool(outcome.get("would_failover") if "would_failover" in outcome else plan.get("would_failover"))
+    if failed_over:
+        reason = outcome.get("failover_reason") or plan.get("reason") or ""
+        failover_to = actual_id
+    elif would:
+        reason = outcome.get("would_reason") or plan.get("would_reason") or ""
+        failover_to = outcome.get("would_account_id") or plan.get("would_account_id") or ""
+    else:
+        reason = ""
+        failover_to = ""
+    try:
+        attempts = int(outcome.get("attempts") or plan.get("attempts") or 1)
+    except (TypeError, ValueError):
+        attempts = 1
+    return {
+        "account_id": actual_id or "",
+        "account_label": label or "",
+        "ledger_key": plan.get("ledger_key") or "",
+        "session_id": session_id or "",
+        "failover": failed_over,
+        "failover_reason": reason or "",
+        "failover_to": failover_to or "",
+        "attempts": attempts,
+    }
+
+
+def _muse_headers(plan: dict | None, account: dict | None, outcome: dict | None = None) -> dict:
+    view = _muse_view(plan, account, outcome)
+    return {
+        "x-muse-account-id": _header_token(view["account_id"]),
+        "x-muse-account-label": _header_token(view["account_label"]),
+        "x-muse-ledger-key": _header_token(view["ledger_key"]),
+        "x-muse-session-id": _header_token(view["session_id"]),
+        "x-muse-failover": "true" if view["failover"] else "false",
+        "x-muse-failover-reason": _header_token(view["failover_reason"]),
+        "x-muse-failover-to": _header_token(view["failover_to"]),
+        "x-muse-attempts": str(view["attempts"]),
+    }
+
+
+def _is_no_picker_error(exc: BaseException) -> bool:
+    text = str(exc)
+    return "no-picker" in text.lower() or "无法切换到网页选卡" in text
+
+
+def _picker_candidate(exclude: set[str], *, require_picker: bool) -> dict | None:
+    now = time.time()
+    rows = []
+    for account in store.accounts:
+        aid = account.get("id")
+        if not aid or aid in exclude or aid in ACCOUNT_POOL.busy_accounts:
+            continue
+        if not account.get("enabled", True) or not account.get("cookies"):
+            continue
+        if account.get("ok") is False:
+            continue
+        if require_picker and account_health_reason(account, require_picker=True, now=now):
+            continue
+        if failover_live() and account_health_reason(account, require_picker=require_picker, now=now):
+            continue
+        rows.append(account)
+    if not rows:
+        return None
+    rows.sort(key=lambda a: (a.get("last_used") or 0, a.get("use_count") or 0))
+    return rows[0]
+
+
+def _publish_chat_outcome(outcome: dict, plan: dict | None, account_id: str | None,
+                          state: dict | None, attempts: int) -> None:
+    account = store.get_account(account_id) if account_id else None
+    plan = plan or {}
+    state = state or {}
+    session_id = state.get("session_id")
+    if not session_id:
+        session_id = plan.get("session_id") or ""
+    outcome.clear()
+    outcome.update({
+        "account_id": account_id or plan.get("account_id") or "",
+        "account_label": (account or {}).get("label") or plan.get("account_label") or "",
+        "session_id": session_id or "",
+        "failover": bool(plan.get("failover")),
+        "failover_reason": plan.get("reason") or "",
+        "would_failover": bool(plan.get("would_failover")),
+        "would_account_id": plan.get("would_account_id"),
+        "would_reason": plan.get("would_reason"),
+        "attempts": attempts,
+        "ledger_key": plan.get("ledger_key") or "",
+    })
+
+
+def _switch_sidechat_account(plan: dict | None, previous_id: str | None,
+                             account: dict, reason: str) -> dict | None:
+    if plan is None:
+        return None
+    plan = dict(plan)
+    retired = plan.get("session_id") or plan.get("retire_session_id")
+    plan["session_id"] = None
+    plan["bound_account_id"] = None
+    plan["failover"] = True
+    plan["would_failover"] = False
+    plan["account_from"] = plan.get("account_from") or previous_id
+    plan["account_id"] = account.get("id")
+    plan["account_label"] = account.get("label") or ""
+    plan["reason"] = reason
+    if retired:
+        plan["retire_session_id"] = retired
+    return plan
+
+
 def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                      timeout: int, account_id: str | None,
                      chat_model: str | None = None,
-                     sidechat: dict | None = None):
+                     sidechat: dict | None = None,
+                     outcome: dict | None = None):
     """在独立线程中执行 chat_stream 并持有 GEN_LOCK，通过 Queue 往外吐。
     无论下游客户端何时断连、异常或超时，stop_event + finally 块保证 100% 立即释放 GEN_LOCK，绝不死锁。
     若首字前遇到单账号 VM 卡死或会话异常，自动切换下一个健康账号重试一次。
-    换号时丢掉原来的 sessionId（旁聊不能跨账号续用）。"""
+    换号时丢掉原来的 sessionId（旁聊不能跨账号续用）。
+    FAILOVER_LIVE 关闭时，no-picker 与显式账号忙碌只记 failover_would，不切号。
+    """
     import queue
     q = queue.Queue(maxsize=100)
     stop_event = threading.Event()
+    if outcome is None:
+        outcome = {}
 
     def worker():
         cur_id = account_id
@@ -509,38 +751,76 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
         last_exc = None
         leased_id = None
         plan = dict(sidechat) if sidechat else None
+        plan = enforce_same_account_session(plan, cur_id)
         state: dict = {}
+        attempts = 1
+        require_picker = chat_model_card(chat_model) in ("wonder", "ember")
+        max_attempts = failover_max_attempts() if failover_live() else 2
+        failed_ids: list[str] = []
         try:
-            for attempt in range(2):
+            for attempt in range(max_attempts):
+                attempts = attempt + 1
                 if stop_event.is_set():
                     return
                 if attempt > 0:
                     if leased_id:
                         ACCOUNT_POOL.release(leased_id)
                         leased_id = None
+                    if cur_id and cur_id not in failed_ids:
+                        failed_ids.append(cur_id)
                     try:
-                        alt = ACCOUNT_POOL.acquire(rotate=True, force_rotate=True, timeout=timeout)
+                        want_picker = require_picker and (plan or {}).get("reason") == "no_picker"
+                        if want_picker:
+                            preview = _picker_candidate(set(failed_ids), require_picker=True)
+                            alt = ACCOUNT_POOL.acquire(
+                                account_id=preview["id"], timeout=timeout,
+                            ) if preview else None
+                        else:
+                            alt = ACCOUNT_POOL.acquire(
+                                rotate=True, force_rotate=True, timeout=timeout)
                     except Exception:
                         break
-                    if not alt or alt["id"] == cur_id:
-                        if alt:
+                    if not alt or alt["id"] == cur_id or alt["id"] in failed_ids:
+                        if alt and alt["id"] not in failed_ids:
                             leased_id = alt["id"]
                         break
+                    previous = cur_id
+                    reason = (plan or {}).get("reason") or "auth"
                     cur_id = alt["id"]
                     leased_id = cur_id
                     cur_cookies = alt["cookies"]
                     cur_exp = alt.get("cookies_exp")
                     log.info("【对话自动切号】切换到备用账号 %s (%s) 重试...", alt.get("label"), cur_id)
-                    if plan:
-                        retired = plan.get("session_id") or plan.get("retire_session_id")
-                        plan["session_id"] = None
-                        plan["failover"] = True
-                        plan["account_id"] = cur_id
-                        if retired:
-                            plan["retire_session_id"] = retired
+                    log.info(
+                        "failover_live=1 account_from=%s account_to=%s reason=%s",
+                        previous, cur_id, reason,
+                    )
+                    plan = _switch_sidechat_account(plan, previous, alt, reason)
                 elif cur_id:
-                    ACCOUNT_POOL.acquire(account_id=cur_id, timeout=timeout)
-                    leased_id = cur_id
+                    failover_out: dict = {}
+                    allow = bool(plan and plan.get("explicit_account"))
+                    try:
+                        leased = ACCOUNT_POOL.acquire(
+                            account_id=cur_id, timeout=timeout,
+                            allow_degrade=allow, failover_out=failover_out,
+                        )
+                    except Exception as exc:
+                        last_exc = exc
+                        break
+                    if leased["id"] != cur_id:
+                        previous = cur_id
+                        cur_id = leased["id"]
+                        cur_cookies = leased["cookies"]
+                        cur_exp = leased.get("cookies_exp")
+                        leased_id = cur_id
+                        plan = _switch_sidechat_account(plan, previous, leased, "busy")
+                    else:
+                        leased_id = cur_id
+                        if plan is not None and failover_out.get("action") == "dry":
+                            plan["would_failover"] = True
+                            plan["would_account_id"] = failover_out.get("would_account_id")
+                            plan["would_reason"] = "busy"
+                            plan["account_from"] = cur_id
 
                 yielded = False
                 state.clear()
@@ -570,16 +850,57 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                                 return
                     if cur_id:
                         store.mark(cur_id, True, "")
+                        store.note_account_success(cur_id)
                         _sync_cookies(cur_id)
-                    _commit_sidechat(plan, state, cur_id)
+                    _commit_sidechat(plan, state, cur_id, follow_map=True)
                     return
                 except MuseAuthError as exc:
                     last_exc = exc
                     if cur_id:
                         store.mark(cur_id, False, str(exc))
+                        store.note_account_failure(
+                            cur_id, "auth",
+                            cooldown_seconds=failover_cooldown_seconds(),
+                        )
                         _invalidate_sidechats(cur_id, "auth")
+                    if plan is not None:
+                        plan["reason"] = "auth"
                     engine.close_current_page()
                     if yielded:
+                        break
+                except MuseGenerationError as exc:
+                    last_exc = exc
+                    no_picker = _is_no_picker_error(exc)
+                    if no_picker and cur_id:
+                        store.note_account_failure(cur_id, "no_picker", no_picker=True)
+                    if no_picker and not yielded and failover_live():
+                        if plan is not None:
+                            plan["reason"] = "no_picker"
+                            plan["failover"] = True
+                            retired = plan.get("session_id") or plan.get("retire_session_id")
+                            plan["session_id"] = None
+                            if retired:
+                                plan["retire_session_id"] = retired
+                        if cur_id and cur_id not in failed_ids:
+                            failed_ids.append(cur_id)
+                        engine.close_current_page()
+                        continue
+                    if no_picker and not yielded and plan is not None:
+                        alt = _picker_candidate({cur_id} if cur_id else set(), require_picker=True)
+                        plan["would_failover"] = bool(alt)
+                        plan["would_account_id"] = (alt or {}).get("id")
+                        plan["would_reason"] = "no_picker"
+                        plan["account_from"] = cur_id
+                        log.info(
+                            "failover_would=1 account_from=%s account_to=%s reason=no_picker",
+                            cur_id, (alt or {}).get("id"),
+                        )
+                    _commit_sidechat(plan, state, cur_id)
+                    try:
+                        engine.reset_thread()
+                    except Exception:
+                        pass
+                    if yielded or no_picker:
                         break
                 except Exception as exc:
                     last_exc = exc
@@ -593,6 +914,7 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
             if last_exc is not None:
                 q.put(("error", last_exc))
         finally:
+            _publish_chat_outcome(outcome, plan, cur_id, state, attempts)
             if leased_id:
                 ACCOUNT_POOL.release(leased_id)
             engine.close_current_page()
@@ -676,10 +998,12 @@ class ChatRequest(BaseModel):
     tool_choice: object | None = None
     response_format: object | None = None
     stream_options: object | None = None
-    # 旁聊台账。也可改用请求头 X-Muse-Role / X-Muse-Project，见 README。
+    # 旁聊台账。也可改用请求头 X-Muse-Role / X-Muse-Project / X-Muse-Account，见 README。
     user: str | None = None
     muse_role: str | None = None
     muse_project: str | None = None
+    muse_account: str | None = None
+    account_id: str | None = None
     role: str | None = None
     project: str | None = None
 
@@ -697,6 +1021,8 @@ class ResponsesRequest(BaseModel):
     user: str | None = None
     muse_role: str | None = None
     muse_project: str | None = None
+    muse_account: str | None = None
+    account_id: str | None = None
     role: str | None = None
     project: str | None = None
 
@@ -1720,6 +2046,7 @@ async def chat_completions(
     _=Depends(auth),
     x_muse_role: str | None = Header(default=None),
     x_muse_project: str | None = Header(default=None),
+    x_muse_account: str | None = Header(default=None),
 ):
     """OpenAI 兼容的对话接口 —— 各类智能体客户端都能接。
 
@@ -1733,9 +2060,10 @@ async def chat_completions(
 
     对话与生图/生视频共用同一个浏览器实例，靠 `GEN_LOCK` 串行。
 
-    旁聊：请求头 `X-Muse-Role` / `X-Muse-Project`，或 body 的
-    `muse_role` / `muse_project`（也接受 `role` / `project`，以及
-    `user=role:<slug>[:proj:<slug>]`）。都没有则每次新开 /thread/new。
+    旁聊：请求头 `X-Muse-Role` / `X-Muse-Project` / `X-Muse-Account`，或 body 的
+    `muse_role` / `muse_project` / `muse_account`（也接受 `role` / `project` /
+    `account_id`，以及 `user=role:<slug>[:proj:<slug>]`）。都没有则每次新开 /thread/new。
+    响应头 `x-muse-account-id`、`x-muse-failover`、`x-muse-session-id` 告诉调用方实际用了哪号。
     """
     prompt = build_chat_prompt(req.messages) or (req.prompt or "").strip()
     if not prompt:
@@ -1752,13 +2080,19 @@ async def chat_completions(
     model = resolve_model(req.model, default="muse-spark")
     timeout = int(req.timeout or CFG.chat_timeout)
     role, project = _chat_dimensions(req, x_muse_role, x_muse_project)
-    acc, sidechat = _route_chat_account(role, project)
+    explicit = _explicit_account(req, x_muse_account)
+    acc, sidechat = _route_chat_account(
+        role, project,
+        explicit_account=explicit,
+        require_picker=chat_model_card(model) in ("wonder", "ember"),
+    )
 
     cid = "chatcmpl-" + uuid.uuid4().hex[:24]
     created = int(time.time())
     acc_id = acc["id"]
     cookies = acc["cookies"]
     expires = acc.get("cookies_exp")
+    outcome: dict = {}
 
     def tool_call_deltas(calls: list[dict]) -> list[list[dict]]:
         """按 OpenAI 习惯分两片发：先 id/name，再 arguments 全文。"""
@@ -1777,7 +2111,7 @@ async def chat_completions(
 
                 stream_gen = safe_chat_stream(
                     cookies, prompt, expires, timeout, account_id=acc_id,
-                    chat_model=model, sidechat=sidechat)
+                    chat_model=model, sidechat=sidechat, outcome=outcome)
                 if not tool_note:
                     for chunk in stream_gen:
                         for piece in _pace_text(chunk):
@@ -1822,6 +2156,7 @@ async def chat_completions(
                                 "created": created, "model": model,
                                 "choices": [],
                                 "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}})
+                yield _sse({"muse": _muse_view(sidechat, acc, outcome)})
                 yield "data: [DONE]\n\n"
                 store.mark(acc_id, True, "")
             except MuseAuthError as exc:
@@ -1836,12 +2171,14 @@ async def chat_completions(
                 yield _sse({"error": {"message": str(exc), "type": "server_error", "code": 502}})
             except Exception as exc:
                 yield _sse({"error": {"message": f"内部错误: {exc}", "type": "server_error", "code": 500}})
-        return StreamingResponse(sync_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
+        stream_headers = dict(_SSE_HEADERS)
+        stream_headers.update(_muse_headers(sidechat, acc, outcome))
+        return StreamingResponse(sync_stream(), media_type="text/event-stream", headers=stream_headers)
 
     def run() -> str:
         return "".join(safe_chat_stream(
             cookies, prompt, expires, timeout, account_id=acc_id,
-            chat_model=model, sidechat=sidechat))
+            chat_model=model, sidechat=sidechat, outcome=outcome))
 
     try:
         text = await asyncio.to_thread(run)
@@ -1851,21 +2188,27 @@ async def chat_completions(
         raise HTTPException(502, str(exc))
 
     usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    muse = _muse_view(sidechat, acc, outcome)
+    headers = _muse_headers(sidechat, acc, outcome)
     if tool_note:
         calls, rest = parse_tool_calls(text)
         if calls:
-            return {"id": cid, "object": "chat.completion", "created": created,
-                    "model": model,
-                    "choices": [{"index": 0, "finish_reason": "tool_calls",
-                                 "message": {"role": "assistant",
-                                             "content": rest or None,
-                                             "tool_calls": calls}}],
-                    "usage": usage}
-    return {"id": cid, "object": "chat.completion", "created": created,
-            "model": model,
-            "choices": [{"index": 0, "finish_reason": "stop",
-                         "message": {"role": "assistant", "content": text}}],
-            "usage": usage}
+            return JSONResponse(
+                {"id": cid, "object": "chat.completion", "created": created,
+                 "model": model,
+                 "choices": [{"index": 0, "finish_reason": "tool_calls",
+                              "message": {"role": "assistant",
+                                          "content": rest or None,
+                                          "tool_calls": calls}}],
+                 "usage": usage, "muse": muse},
+                headers=headers)
+    return JSONResponse(
+        {"id": cid, "object": "chat.completion", "created": created,
+         "model": model,
+         "choices": [{"index": 0, "finish_reason": "stop",
+                      "message": {"role": "assistant", "content": text}}],
+         "usage": usage, "muse": muse},
+        headers=headers)
 
 
 def _responses_messages(req: ResponsesRequest) -> list[ChatMessage]:
@@ -1909,6 +2252,7 @@ async def responses_api(
     _=Depends(auth),
     x_muse_role: str | None = Header(default=None),
     x_muse_project: str | None = Header(default=None),
+    x_muse_account: str | None = Header(default=None),
 ):
     """OpenAI Responses API —— 新版 Codex 默认走这个端点。
 
@@ -1922,12 +2266,18 @@ async def responses_api(
     model = resolve_model(req.model, default="muse-spark")
     timeout = int(req.timeout or CFG.chat_timeout)
     role, project = _chat_dimensions(req, x_muse_role, x_muse_project)
-    acc, sidechat = _route_chat_account(role, project)
+    explicit = _explicit_account(req, x_muse_account)
+    acc, sidechat = _route_chat_account(
+        role, project,
+        explicit_account=explicit,
+        require_picker=chat_model_card(model) in ("wonder", "ember"),
+    )
 
     rid = "resp_" + uuid.uuid4().hex[:24]
     mid = "msg_" + uuid.uuid4().hex[:24]
     created = int(time.time())
     acc_id, cookies, expires = acc["id"], acc["cookies"], acc.get("cookies_exp")
+    outcome: dict = {}
 
     def envelope(status: str, text: str = "") -> dict:
         done = status == "completed"
@@ -1958,7 +2308,7 @@ async def responses_api(
                 full = ""
                 for chunk in safe_chat_stream(
                         cookies, prompt, expires, timeout, account_id=acc_id,
-                        chat_model=model, sidechat=sidechat):
+                        chat_model=model, sidechat=sidechat, outcome=outcome):
                     full += chunk
                     yield _sse_event("response.output_text.delta", {
                         "type": "response.output_text.delta", "item_id": mid,
@@ -1972,20 +2322,24 @@ async def responses_api(
                              "status": "completed",
                              "content": [{"type": "output_text", "text": full,
                                           "annotations": []}]}})
+                done = envelope("completed", full)
+                done["muse"] = _muse_view(sidechat, acc, outcome)
                 yield _sse_event("response.completed", {
                     "type": "response.completed",
-                    "response": envelope("completed", full)})
+                    "response": done})
             except Exception as exc:  # noqa: BLE001
                 log.warning("responses 流式失败: %s", exc)
                 yield _sse_event("response.failed", {
                     "type": "response.failed",
                     "response": envelope("failed")})
-        return StreamingResponse(sync_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
+        stream_headers = dict(_SSE_HEADERS)
+        stream_headers.update(_muse_headers(sidechat, acc, outcome))
+        return StreamingResponse(sync_stream(), media_type="text/event-stream", headers=stream_headers)
 
     def run() -> str:
         return "".join(safe_chat_stream(
             cookies, prompt, expires, timeout, account_id=acc_id,
-            chat_model=model, sidechat=sidechat))
+            chat_model=model, sidechat=sidechat, outcome=outcome))
 
     try:
         text = await asyncio.to_thread(run)
@@ -1994,7 +2348,9 @@ async def responses_api(
     except MuseGenerationError as exc:
         raise HTTPException(502, str(exc))
 
-    return envelope("completed", text)
+    body = envelope("completed", text)
+    body["muse"] = _muse_view(sidechat, acc, outcome)
+    return JSONResponse(body, headers=_muse_headers(sidechat, acc, outcome))
 
 
 @app.get("/v1/media/{name}")
@@ -2047,7 +2403,10 @@ def admin_status(_=Depends(auth)):
                    "image_timeout": CFG.image_timeout,
                    "video_timeout": CFG.video_timeout,
                    "host": CFG.host, "port": CFG.port,
-                   "public_base": base},
+                   "public_base": base,
+                   "failover_live": failover_live(),
+                   "failover_cooldown_seconds": failover_cooldown_seconds(),
+                   "failover_max_attempts": failover_max_attempts()},
     }
 
 

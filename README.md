@@ -294,9 +294,74 @@ curl -X POST "http://localhost:18610/v1/chat/completions" \
 
 等价写法：`"muse_role": "ops", "muse_project": "bridgeai"`，或 `"user": "role:ops:proj:bridgeai"`。`/v1/responses` 使用同一套头和字段。`model` 仍是 `muse-spark` / `muse-wonder` / `muse-ember`，选卡逻辑不变。
 
-台账键：`role:ops`，或 `role:ops:proj:bridgeai`。字段见示例文件。`status` 为 `pending`（还没有 sessionId）、`active`（可续用）、`stale`（不再续用）、`deleted`（保留位）。`role_account_map` 把角色钉到账号池的 `id`；`default` 是没有单独映射时的兜底。映射不会自动改账号池。
+台账键：`role:ops`，或 `role:ops:proj:bridgeai`。字段见示例文件。`status` 为 `pending`（还没有 sessionId）、`active`（可续用）、`stale`（不再续用）、`deleted`（保留位）。`role_account_map` 把角色钉到账号池的 `id`；`default` 是没有单独映射时的兜底。改映射不会改账号池里的 cookie。
 
 第一次使用某个键时，按映射选账号（映射的号不可用就换一个健康号），打开新旁聊，首条消息发出且 URL 变成 `/thread/<sessionId>` 后把 id 写回台账。之后同一键会打开这个 URL。打开失败、被重定向走，或气泡数达到 20，会把旧 id 记到 `prior_session_id` 并新建。账号禁用、重新导入 cookie、或会话认证失败时，该账号下的条目全部标 `stale`（session 不能换号接着用）。
+
+### 1.2 显式账号与 failover（默认只观察）
+
+Router 可以再带一个账号池 id，钉住某一次请求用哪一个号。这不是 cookie。
+
+优先级：
+
+1. `X-Muse-Account`（或 JSON `muse_account`，其次 `account_id`）
+2. 台账里还能续用的 active 旁聊所在账号（为了接着同一条 session，高于角色映射）
+3. `role_account_map[role]`，没有则 `default`
+4. 池内健康账号，按最久未用
+
+未知 id，或字符不在 `[A-Za-z0-9_-]{1,64}`，返回 400。只传 project 不传 role 仍是 400。OpenAI 的 `user` 不解析账号。
+
+换号一定新建旁聊：旧 `session_id` 记到 `prior_session_id`，不会把 session 迁到另一个账号。显式钉了另一个号时也是新建。同一号上的 active 旁聊会继续用。
+
+成功切到另一个号之后，`role_account_map` 会改成这个新号，角色跟着走。只是「本会切」而没有真切时，不改映射。
+
+账号上的 `failover` 字段（写在 `accounts.json`，不进 cookie）：
+
+```json
+{
+  "cooldown_until": 0,
+  "fail_count": 0,
+  "last_fail_reason": null,
+  "last_fail_at": null,
+  "no_picker": false
+}
+```
+
+`no_picker` 表示这个号的网页上没有 Wonder/Ember 选卡。只在请求 `muse-wonder` / `muse-ember` 时考虑。额度只认缓存里 `quota.found=true` 且明确用尽的记录，读失败不当作耗尽。
+
+环境变量（默认都是安全侧）：
+
+| 变量 | 默认 | 作用 |
+|---|---|---|
+| `FAILOVER_LIVE` | `0` | `1` 才按额度、无选卡、冷却、显式账号忙碌真切号。别名 `MUSE2API_FAILOVER_LIVE`。改完要重启进程。 |
+| `FAILOVER_COOLDOWN_SECONDS` | `1200` | 认证失败或额度耗尽后的冷却。 |
+| `FAILOVER_MAX_ATTEMPTS` | `2` | `FAILOVER_LIVE=1` 时单请求最多试几个号，上限 3。 |
+
+`FAILOVER_LIVE=0` 时，上述新原因只打日志 `failover_would=1 account_from=… account_to=… reason=…`，请求仍用原账号。账号禁用、没有 cookie、`ok=false`，以及首字前的认证失败重试，仍是原来的行为。认证失败重试成功后同样会改写 `role_account_map`。
+
+Wonder/Ember 遇到当前号 `no_picker`：开关关闭时留在原号并在日志和 `x-muse-failover-to` 里写出会去的号；开关打开时改去有选卡的号。池里一个都没有则 503。显式 `X-Muse-Account` 正忙：开关打开时改去别的空闲号；关闭时继续等这个号，并记下本会降级到谁。
+
+非流式响应带这些头，body 里有同样内容的 `muse` 对象。流式响应的头是开流前的计划，最终用了哪号看 `[DONE]` 前的 `muse` SSE（Responses API 则在 `response.completed` 里）。
+
+| 头 | 含义 |
+|---|---|
+| `x-muse-account-id` / `x-muse-account-label` | 实际使用的账号 |
+| `x-muse-ledger-key` | 旁聊键，没有则为空 |
+| `x-muse-session-id` | 旁聊 id，可能为空 |
+| `x-muse-failover` | `true` / `false`，是否已经换号 |
+| `x-muse-failover-reason` | `auth` / `quota` / `no_picker` / `cooldown` / `busy` / `explicit` / `role_map` 等 |
+| `x-muse-failover-to` | 已经换去的号，或开关关闭时本会换去的号 |
+| `x-muse-attempts` | 本请求尝试次数 |
+
+`GET /admin/status` 的 `config.failover_live` 可以看到当前开关。管理页不单独画冷却。回复正文里的限额文案、连续 session 死亡计数、Router 读这些头再派发，都不在这一刀里。
+
+打开真切号（仍不要靠这次改动去部署）：
+
+```bash
+FAILOVER_LIVE=1
+```
+
+然后重启 muse2api。关掉变量即回到只观察。
 
 配置映射（把 `example_acc_ops` 换成账号池里的真实 id）：
 
