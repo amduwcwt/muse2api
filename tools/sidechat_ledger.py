@@ -10,6 +10,7 @@
 
 map 把角色钉到账号池里的 id（与 data/accounts.json 的 id 一致）。
 账号不可用时，下一次该角色的请求会换一个可用账号并新建旁聊。
+服务进程会在管理接口和下一次带 role 的对话时重新读这个文件，改映射不用重启。
 """
 from __future__ import annotations
 

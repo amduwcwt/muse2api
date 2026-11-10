@@ -102,6 +102,19 @@ Upload one product photo and get talking-head sales videos, story-style ad short
 4. **访问管理面板**：
    打开浏览器访问：`http://<你的服务器IP>:18610/admin?key=<你的MUSE2API_KEY>`
 
+   镜像构建会把 `sidechat.py` 和 `app.py`、`engine.py`、`config.py` 一起复制进容器。缺少 `sidechat.py` 时进程会在 `from sidechat import ...` 退出。
+
+   默认 Compose 只挂载 `./data`。若要改这几个源文件后不重建镜像，可以在 `docker-compose.yml` 里按文件挂载（改完需要 `docker compose restart` 才会重新 import）：
+
+   ```yaml
+   volumes:
+     - ./data:/app/data
+     - ./app.py:/app/app.py
+     - ./engine.py:/app/engine.py
+     - ./config.py:/app/config.py
+     - ./sidechat.py:/app/sidechat.py
+   ```
+
 ---
 
 ### 方式二：裸机 / VPS 部署（Ubuntu / Debian）
@@ -293,6 +306,8 @@ python tools/sidechat_ledger.py list
 python tools/sidechat_ledger.py cleanup          # 7 天未用，或同一账号非 pin 超过 20 条 → stale
 python tools/sidechat_ledger.py stale role:ops   # 手工标 stale
 ```
+
+`map` / `cleanup` / `stale` 写的是磁盘上的 `sidechat_ledger.json`。正在跑的进程会在 `GET /admin/sidechats`、清理接口，以及下一次带 role 的对话里按文件修改时间重新读盘，改映射不用重启。改的是 `sidechat.py` 本身时仍要重建镜像，或重启已经把该文件挂进容器的进程。
 
 管理接口（Bearer 鉴权，只读列表，不返回 cookie）：
 
