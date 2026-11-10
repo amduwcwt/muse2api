@@ -437,6 +437,31 @@ def test_chat_route_and_openai_body():
     print("PASS: chat route and openai body")
 
 
+def test_running_ledger_reloads_cli_map():
+    """CLI 另开进程写盘后，长寿命的那份台账不用重建对象也能看见映射。"""
+    path = tempfile.mktemp(suffix=".json")
+    try:
+        running = SidechatLedger(path)
+        assert running.snapshot()["role_account_map"] == {}
+        cli = SidechatLedger(path)
+        cli.set_role_account("ops", "acc-ops")
+        assert running.snapshot()["role_account_map"]["ops"] == "acc-ops"
+        plan = running.plan("ops", None, _accounts())
+        assert plan["account_id"] == "acc-ops"
+        assert plan["reason"] == "role_map"
+        running.record_result(
+            ledger_key="role:ops", role="ops", project=None,
+            account_id="acc-ops", account_label="ops",
+            session_id="example-session-not-real", nav="fresh",
+        )
+        assert running.snapshot()["role_account_map"]["ops"] == "acc-ops"
+        assert SidechatLedger(path).snapshot()["role_account_map"]["ops"] == "acc-ops"
+    finally:
+        if os.path.exists(path):
+            os.remove(path)
+    print("PASS: reload role map from disk")
+
+
 def test_example_file_has_no_secrets():
     example = json.loads((ROOT / "data" / "sidechat_ledger.example.json").read_text(encoding="utf-8"))
     blob = json.dumps(example)
@@ -454,5 +479,6 @@ if __name__ == "__main__":
     test_store_pick_prefers_pinned_account()
     test_reset_thread_navigation()
     test_chat_route_and_openai_body()
+    test_running_ledger_reloads_cli_map()
     test_example_file_has_no_secrets()
     print("ALL SIDECHAT TESTS PASSED")
