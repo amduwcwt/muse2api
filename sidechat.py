@@ -3,6 +3,9 @@
 运行时文件与 accounts.json 同目录：data/sidechat_ledger.json。
 仓库只提交 data/sidechat_ledger.example.json，不写真实 sessionId、cookie 或 API key。
 
+这份 JSON 只做 session 路由（session_id、账号、use_count、status）。
+对话正文在 data/relay.sqlite，不要把消息写进这里。
+
 没有 role/project 的请求不进台账，由调用方走策略 A（每次新开 /thread/new，
 不再按气泡 <24 复用上一条旁聊）。
 """
@@ -14,6 +17,7 @@ import threading
 import time
 import uuid
 
+from redact import scrub as _scrub
 from store import _read, _write
 
 LEDGER_VERSION = 1
@@ -28,11 +32,6 @@ _USER_KEY = re.compile(
 )
 _SESSION_ID = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 _RESERVED_THREAD = {"new", "main"}
-_SECRET_KEYS = {
-    "cookies", "cookie", "cookie_header", "authorization", "api_key",
-    "password", "proxy",
-}
-
 _LOCKS: dict[str, threading.Lock] = {}
 _LOCKS_GUARD = threading.Lock()
 
@@ -176,19 +175,6 @@ def _empty_doc() -> dict:
         "entries": [],
         "role_account_map": {},
     }
-
-
-def _scrub(value):
-    """台账落盘前丢掉任何看起来像凭据的字段。"""
-    if isinstance(value, dict):
-        return {
-            str(k): _scrub(v)
-            for k, v in value.items()
-            if str(k).lower() not in _SECRET_KEYS
-        }
-    if isinstance(value, list):
-        return [_scrub(v) for v in value]
-    return value
 
 
 class SidechatLedger:
