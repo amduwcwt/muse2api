@@ -102,7 +102,7 @@ Upload one product photo and get talking-head sales videos, story-style ad short
 4. **访问管理面板**：
    打开浏览器访问：`http://<你的服务器IP>:18610/admin?key=<你的MUSE2API_KEY>`
 
-   镜像构建会把 `sidechat.py` 和 `app.py`、`engine.py`、`config.py` 一起复制进容器。缺少 `sidechat.py` 时进程会在 `from sidechat import ...` 退出。
+   镜像构建会把 `sidechat.py`、`redact.py`、`relay.py` 和 `app.py`、`engine.py`、`config.py` 一起复制进容器。缺少 `sidechat.py` 时进程会在 `from sidechat import ...` 退出。
 
    默认 Compose 只挂载 `./data`。若要改这几个源文件后不重建镜像，可以在 `docker-compose.yml` 里按文件挂载（改完需要 `docker compose restart` 才会重新 import）：
 
@@ -113,6 +113,8 @@ Upload one product photo and get talking-head sales videos, story-style ad short
      - ./engine.py:/app/engine.py
      - ./config.py:/app/config.py
      - ./sidechat.py:/app/sidechat.py
+     - ./redact.py:/app/redact.py
+     - ./relay.py:/app/relay.py
    ```
 
 ---
@@ -324,6 +326,30 @@ python tools/sidechat_ledger.py stale role:ops   # 手工标 stale
 3. 同一 role 再加 `X-Muse-Project`，应是另一条旁聊；账号与 `role_account_map` 一致。
 4. 把台账里的 `session_id` 改成不存在的值，下一次应新建并回填。
 5. `GET /admin/sidechats` 能看到条目，且响应里没有 cookie。
+
+### 1.2 对话正文（relay.sqlite）
+
+旁聊 JSON 仍然只记 `session_id`、账号、`use_count`、`status`。用户消息和 Muse 回复写在 `data/relay.sqlite`（WAL）。不要把正文追加进 `sidechat_ledger.json`。
+
+客户端用请求头 `X-Muse-Conversation` 作为恢复键（Super Agent Engine 以后会传 `ticket.id`）。没有这个头时，每一轮只存本轮最后一条用户消息和回复。有这个头时，第一轮存 system 和第一条 user，之后只追加新消息，不把整段 `messages` 再写一遍。账号仍只由 `role_account_map` 和 `plan()` 决定，没有 `X-Muse-Account`。
+
+成功的 `/v1/chat/completions` 和 `/v1/responses` 会在响应头带回 `X-Muse-Conversation-Id`、`X-Muse-Session-Id`、`X-Muse-Nav`，JSON 里多一个 `muse` 对象。原有字段不变。落盘失败只打日志，对话仍返回。
+
+管理页「对话记录」和下面这些接口都要 Bearer：
+
+- `GET /admin/relay/conversations`
+- `GET /admin/relay/conversations/{id}`
+- `GET /admin/relay/export`（JSONL 流）
+- `GET /v1/conversations/messages`（请求头 `X-Muse-Conversation`；跳过 `source=warmup`）
+
+保留 14 天或 400 MiB，可用 `MUSE2API_RELAY_RETENTION_DAYS` 和 `MUSE2API_RELAY_MAX_BYTES` 覆盖。清理在启动时和之后每小时跑一次，只删这一个库里的过期行，不动 `accounts.json`、cookie、浏览器配置或 `data/media`。
+
+```bash
+python tests/test_relay_ledger.py
+python tests/test_sidechat_ledger.py
+```
+
+这一层还没有部署到 192，需要操作员另行批准。P2（点选卡片）和 P3（加密填密钥）不在这次改动里。
 
 ### 2. 文生图（Image Generation）
 

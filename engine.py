@@ -1780,6 +1780,7 @@ class MuseEngine:
     def _ensure_chat_model(self, chat_model: str | None, stop_event=None,
                            wait_s: float = 6.0) -> str:
         """发送前确保网页选卡与请求一致。返回实际卡：auto/wonder/ember。"""
+        self.chat_warmup_sent = False
         card = self._normalize_chat_card(chat_model)
         deadline = time.time() + wait_s
         last: dict = {}
@@ -1800,6 +1801,7 @@ class MuseEngine:
         log.info("选卡 %s 未就绪，热身后重试: %s", card, last)
         try:
             self._send(".")
+            self.chat_warmup_sent = True
             self._wait_generation_idle(timeout=90.0, stop_event=stop_event)
         except Exception as exc:  # noqa: BLE001
             raise MuseGenerationError(f"选卡热身失败（{card}）: {exc}") from exc
@@ -1829,6 +1831,7 @@ class MuseEngine:
         timeout = int(timeout or getattr(self.cfg, "chat_timeout", 300))
         nav = "skipped"
         resumed_id = None
+        self.chat_warmup_sent = False
         try:
             self.ensure_page(cookies, expires, account_id=account_id)
             nav = self.reset_thread(for_chat=True, session_id=session_id)

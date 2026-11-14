@@ -281,6 +281,7 @@
     <button class="active" data-t="pool">账号池</button>
     <button data-t="cookie">获取 Cookie</button>
     <button data-t="tasks">任务记录</button>
+    <button data-t="relay">对话记录</button>
     <button data-t="media">媒体库</button>
     <button data-t="play">接口测试</button>
     <button data-t="docs">接入文档</button>
@@ -542,6 +543,26 @@
     </div>
   </section>
 
+  <!-- ==================== 对话记录 ==================== -->
+  <section class="tab" id="tab-relay">
+    <div class="card">
+      <h3>对话台账 <span class="tag" id="relayCount">0</span></h3>
+      <div class="hint">本地 SQLite 只保存已脱敏的对话文本，用来排查和导出。这里没有 cookie、密钥或代理密码。选卡热身的「.」会标成 warmup，恢复上下文时会跳过。</div>
+      <div style="margin-bottom:12px;display:flex;gap:9px;flex-wrap:wrap">
+        <button class="ghost mini" onclick="loadRelay()">刷新</button>
+        <button class="ghost mini" onclick="downloadRelay('/admin/relay/export','relay.jsonl')">导出 JSONL</button>
+      </div>
+      <div class="tblwrap"><table>
+        <thead><tr>
+          <th>对话</th><th>客户端 ID</th><th>角色</th><th>项目</th><th>账号</th>
+          <th>模型</th><th>状态</th><th>大小</th><th>更新</th><th></th>
+        </tr></thead>
+        <tbody id="relayBody"><tr><td colspan="10" class="empty">加载中…</td></tr></tbody>
+      </table></div>
+      <div id="relayMsgs" style="margin-top:14px"></div>
+    </div>
+  </section>
+
   <!-- ==================== 媒体库 ==================== -->
   <section class="tab" id="tab-media">
     <div class="card">
@@ -625,7 +646,8 @@ curl -X POST <span class="s">"BASE/v1/chat/completions"</span> \
   -H <span class="s">"Content-Type: application/json"</span> \
   -d <span class="s">'{"model":"muse-spark","messages":[{"role":"user","content":"写一个 Python 快排"}]}'</span>
 
-<span class="c"># 流式：加 "stream":true，返回标准 SSE（data: {...} / data: [DONE]）</span></pre>
+<span class="c"># 流式：加 "stream":true，返回标准 SSE（data: {...} / data: [DONE]）</span>
+<span class="c"># 可选头 X-Muse-Conversation（恢复键）和 X-Muse-Role / X-Muse-Project。响应头带回对话 id、session、nav。</span></pre>
 
       <h4>3. 生图（curl）</h4>
       <pre class="code"><span class="cp" onclick="cp(this)">复制</span>curl -X POST <span class="s">"BASE/v1/images/generations"</span> \
@@ -688,6 +710,10 @@ t = requests.post(<span class="s">"BASE/v1/videos"</span>, json={<span class="s"
           <tr><td class="mono">POST</td><td class="mono">/admin/accounts/{id}/quota</td><td>实时读取该账号剩余额度</td></tr>
           <tr><td class="mono">POST</td><td class="mono">/admin/accounts/{id}/cookies</td><td>更新该账号 cookie</td></tr>
           <tr><td class="mono">GET</td><td class="mono">/admin/tasks</td><td>任务记录</td></tr>
+          <tr><td class="mono">GET</td><td class="mono">/admin/relay/conversations</td><td>对话列表（Bearer，无正文）</td></tr>
+          <tr><td class="mono">GET</td><td class="mono">/admin/relay/conversations/{id}</td><td>一通对话的消息（已脱敏）</td></tr>
+          <tr><td class="mono">GET</td><td class="mono">/admin/relay/export</td><td>JSONL 流式导出</td></tr>
+          <tr><td class="mono">GET</td><td class="mono">/v1/conversations/messages</td><td>按 X-Muse-Conversation 恢复，跳过 warmup</td></tr>
           <tr><td class="mono">GET</td><td class="mono">/admin/media</td><td>媒体库列表</td></tr>
           <tr><td class="mono">POST</td><td class="mono">/admin/media/delete</td><td>批量删除媒体文件</td></tr>
         </tbody>
@@ -1531,6 +1557,7 @@ document.querySelectorAll('nav.tabs button').forEach(b => {
     b.classList.add('active');
     $('tab-' + b.dataset.t).classList.add('active');
     if (b.dataset.t === 'tasks') loadTasks();
+    if (b.dataset.t === 'relay') loadRelay();
     if (b.dataset.t === 'media') loadMedia();
     if (b.dataset.t === 'cookie') $('cmdText').textContent = buildCmd($('inBase').value);
   };
@@ -1959,6 +1986,68 @@ async function delAcc(id, label){
     await api(`/admin/accounts/${id}`, {method:'DELETE'});
     toast('已删除', 'ok'); loadPool();
   }catch(e){ toast('删除失败：' + e.message, 'bad'); }
+}
+
+/* ================= 对话记录 ================= */
+async function loadRelay(){
+  try{
+    const d = await api('/admin/relay/conversations?limit=100');
+    const rows = d.conversations || [];
+    $('relayCount').textContent = rows.length;
+    if (!rows.length){
+      $('relayBody').innerHTML = '<tr><td colspan="10" class="empty">还没有对话记录</td></tr>';
+      $('relayMsgs').innerHTML = '';
+      return;
+    }
+    $('relayBody').innerHTML = rows.map(row => `<tr>
+      <td class="mono">${esc(row.id)}</td>
+      <td class="mono">${esc(row.client_id || '—')}</td>
+      <td>${esc(row.role || '—')}</td>
+      <td>${esc(row.project || '—')}</td>
+      <td>${esc(row.account_label || row.account_id || '—')}</td>
+      <td class="mono">${esc(row.model || '—')}</td>
+      <td>${esc(row.status || '')}</td>
+      <td class="mono">${fmtBytes(row.bytes)}</td>
+      <td class="mono">${fmtTime(row.updated_at)}</td>
+      <td>
+        <button class="ghost mini" onclick="openRelay('${esc(row.id)}')">查看</button>
+        <button class="ghost mini" onclick="downloadRelay('/admin/relay/conversations/${encodeURIComponent(row.id)}/export','${esc(row.id)}.jsonl')">导出</button>
+      </td>
+    </tr>`).join('');
+  }catch(e){
+    $('relayBody').innerHTML = `<tr><td colspan="10" class="empty">加载失败：${esc(e.message)}</td></tr>`;
+  }
+}
+async function openRelay(id){
+  try{
+    const d = await api('/admin/relay/conversations/' + encodeURIComponent(id));
+    const msgs = d.messages || [];
+    if (!msgs.length){ $('relayMsgs').innerHTML = '<div class="empty">没有消息</div>'; return; }
+    $('relayMsgs').innerHTML = msgs.map(m => {
+      const flag = m.truncated ? ' <span class="badge warn">已截断</span>' : '';
+      const err = m.error ? `<div style="color:var(--bad)">${esc(m.error)}</div>` : '';
+      return `<div style="margin:0 0 10px">
+        <div class="mono" style="color:var(--muted)">${esc(m.role)} · ${esc(m.source)}${flag}</div>
+        <pre class="code" style="white-space:pre-wrap;max-height:240px;overflow:auto">${esc(m.content || '')}</pre>
+        ${err}
+      </div>`;
+    }).join('');
+  }catch(e){ toast('读取失败：' + e.message, 'bad'); }
+}
+async function downloadRelay(path, filename){
+  const headers = {};
+  if (KEY) headers['Authorization'] = 'Bearer ' + KEY;
+  const r = await fetch(path, {headers});
+  if (r.status === 401){ setAuth(false); toast('API Key 未填写或填写错误', 'bad'); return; }
+  if (!r.ok){ toast('导出失败', 'bad'); return; }
+  const blob = await r.blob();
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = filename || 'relay.jsonl';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1500);
 }
 
 /* ================= 任务记录 ================= */
