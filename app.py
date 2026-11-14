@@ -473,7 +473,8 @@ def _route_chat_account(role: str | None, project: str | None):
     return acc, plan
 
 
-def _commit_sidechat(plan: dict | None, state: dict, account_id: str | None) -> None:
+def _commit_sidechat(plan: dict | None, state: dict, account_id: str | None,
+                     accept_cursor: bool = False) -> None:
     if not plan or plan.get("strategy") != "bc" or not plan.get("ledger_key"):
         return
     if state.get("nav") not in ("new", "fresh", "resumed", "reused", "stale", "rollover") \
@@ -493,6 +494,9 @@ def _commit_sidechat(plan: dict | None, state: dict, account_id: str | None) -> 
             nav=state.get("nav"),
             retire_session_id=plan.get("retire_session_id"),
             failover=bool(plan.get("failover") or state.get("nav") in ("stale", "rollover")),
+            sent_count=(plan.get("prompt_cursor") or {}).get("sent_count") if accept_cursor else None,
+            sent_fp=(plan.get("prompt_cursor") or {}).get("sent_fp") if accept_cursor else None,
+            sent_system_fp=(plan.get("prompt_cursor") or {}).get("sent_system_fp") if accept_cursor else None,
         )
         log.info(
             "sidechat key=%s account=%s nav=%s captured=%s",
@@ -614,14 +618,14 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                                 reply_parts.append(chunk)
                                 q.put(("data", chunk))
                                 if stop_event.is_set():
-                                    _commit_sidechat(plan, state, cur_id)
+                                    _commit_sidechat(plan, state, cur_id, accept_cursor=True)
                                     return
                         finally:
                             warmup_sent = bool(getattr(engine, "chat_warmup_sent", False))
                     if cur_id:
                         store.mark(cur_id, True, "")
                         _sync_cookies(cur_id)
-                    _commit_sidechat(plan, state, cur_id)
+                    _commit_sidechat(plan, state, cur_id, accept_cursor=yielded)
                     return
                 except MuseAuthError as exc:
                     last_exc = exc
@@ -633,7 +637,7 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                         break
                 except Exception as exc:
                     last_exc = exc
-                    _commit_sidechat(plan, state, cur_id)
+                    _commit_sidechat(plan, state, cur_id, accept_cursor=yielded)
                     try:
                         engine.reset_thread()
                     except Exception:
@@ -1013,6 +1017,185 @@ def build_chat_prompt(messages: list[ChatMessage]) -> str:
         label = "助手" if role == "assistant" else "用户"
         parts.append(f"{label}：\n{text}")
     return "\n\n".join(parts)
+
+
+def _msg_role(message) -> str:
+    if isinstance(message, dict):
+        return (message.get("role") or "").strip().lower()
+    return (getattr(message, "role", "") or "").strip().lower()
+
+
+def _msg_content(message):
+    if isinstance(message, dict):
+        return message.get("content")
+    return getattr(message, "content", None)
+
+
+def _msg_tool_calls(message):
+    if isinstance(message, dict):
+        return message.get("tool_calls")
+    return getattr(message, "tool_calls", None)
+
+
+def _as_chat_message(message) -> ChatMessage:
+    if isinstance(message, ChatMessage):
+        return message
+    return ChatMessage(
+        role=_msg_role(message) or "user",
+        content=_msg_content(message),
+        tool_calls=_msg_tool_calls(message),
+    )
+
+
+def _split_chat_messages(messages) -> tuple[list[ChatMessage], list[ChatMessage]]:
+    """system/developer 与其余轮次分开。游标只覆盖轮次，系统提示单独比较。"""
+    system, turns = [], []
+    for message in messages or []:
+        item = _as_chat_message(message)
+        if _msg_role(item) in ("system", "developer"):
+            system.append(item)
+        else:
+            turns.append(item)
+    return system, turns
+
+
+def message_fingerprint(messages) -> str:
+    """已提交消息的稳定指纹。只含 role / 文本 / tool_calls，不写进日志。"""
+    rows = []
+    for message in messages or []:
+        rows.append({
+            "role": _msg_role(message),
+            "content": _content_text(_msg_content(message)),
+            "tool_calls": _msg_tool_calls(message),
+        })
+    raw = json.dumps(rows, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _fit_chat_messages(messages: list[ChatMessage], limit: int) -> tuple[list[ChatMessage], int]:
+    """超长时保留 system、首条 user 和最近消息，中间换成一行省略说明。"""
+    if len(build_chat_prompt(messages)) <= limit:
+        return messages, 0
+    system, turns = _split_chat_messages(messages)
+    first_idx = next((i for i, item in enumerate(turns) if _msg_role(item) == "user"), None)
+    if first_idx is None:
+        first: list[ChatMessage] = []
+        head: list[ChatMessage] = []
+        tail = turns
+    else:
+        first = [turns[first_idx]]
+        head = turns[:first_idx]
+        tail = turns[first_idx + 1:]
+    last = [tail[-1]] if tail else []
+    middle = tail[:-1] if tail else []
+
+    def pack(keep: int) -> tuple[list[ChatMessage], int]:
+        recent = middle[-keep:] if keep else []
+        omitted = len(head) + len(middle) - keep
+        marker = [ChatMessage(role="user", content=f"[省略 {omitted} 条早期消息]")] if omitted else []
+        return system + first + marker + recent + last, omitted
+
+    lo, hi, best = 0, len(middle), 0
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        packed, _omitted = pack(mid)
+        if len(build_chat_prompt(packed)) <= limit:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return pack(best)
+
+
+def compose_chat_prompt(messages, sidechat: dict | None = None, *,
+                        limit: int | None = None) -> dict:
+    """决定这一轮发给 Muse 的提示词。
+
+    旁聊续用且请求轮次以前缀对齐已发送指纹时，只发新增轮次；系统提示变了就带上最新的。
+    指纹对不上（历史被改写）时清掉 session，改开新旁聊并发全量。
+    旧条目没有指纹时仍续用原线程，这一轮发全量，成功后再把指纹写回去。
+    全量超过 MUSE2API_MAX_PROMPT_CHARS 时截中间，并打 WARNING（含 prompt_chars）。
+    """
+    limit = CFG.max_prompt_chars if limit is None else int(limit)
+    if limit <= 0:
+        limit = 200000
+    normalized = [_as_chat_message(m) for m in (messages or [])]
+    if not normalized:
+        # 没有 messages 时不要因为对不上指纹就把还在用的旁聊清掉。
+        return {
+            "prompt": "",
+            "sidechat": sidechat,
+            "mode": "full",
+            "reason": "empty",
+            "omitted": 0,
+        }
+    system, turns = _split_chat_messages(normalized)
+    plan = dict(sidechat) if sidechat else None
+    mode, reason = "full", "anonymous" if plan is None else "new"
+    to_send = normalized
+    if plan and plan.get("session_id"):
+        stored_fp = plan.get("sent_fp") if isinstance(plan.get("sent_fp"), str) else None
+        stored_count = plan.get("sent_count")
+        prefix_ok = False
+        if stored_fp and isinstance(stored_count, int) and not isinstance(stored_count, bool):
+            if 0 <= stored_count <= len(turns) and message_fingerprint(turns[:stored_count]) == stored_fp:
+                prefix_ok = True
+        if stored_fp is None or not isinstance(stored_count, int) or isinstance(stored_count, bool):
+            mode, reason = "full", "legacy"
+        elif prefix_ok:
+            mode, reason = "incremental", "resume"
+            new_turns = turns[stored_count:]
+            system_fp = message_fingerprint(system)
+            include_system = system_fp != (plan.get("sent_system_fp") or "")
+            chosen_system = system if include_system else []
+            chosen_turns = list(new_turns)
+            if not chosen_turns and not include_system:
+                last_user = next((item for item in reversed(turns) if _msg_role(item) == "user"), None)
+                chosen_turns = [last_user] if last_user is not None else (turns[-1:] if turns else [])
+                log.info(
+                    "sidechat prompt delta empty key=%s action=resend_last",
+                    plan.get("ledger_key"),
+                )
+            to_send = chosen_system + chosen_turns
+        else:
+            mode, reason = "full_new", "mismatch"
+            log.warning(
+                "sidechat prompt prefix mismatch key=%s sent_count=%s action=new_thread",
+                plan.get("ledger_key"), stored_count,
+            )
+            plan["retire_session_id"] = plan.get("session_id")
+            plan["session_id"] = None
+            to_send = normalized
+
+    before = build_chat_prompt(to_send)
+    omitted = 0
+    if len(before) > limit:
+        fitted, omitted = _fit_chat_messages(to_send, limit)
+        prompt = build_chat_prompt(fitted)
+        log.warning(
+            "chat prompt truncated prompt_chars=%s before_chars=%s omitted=%s limit=%s",
+            len(prompt), len(before), omitted, limit,
+        )
+    else:
+        prompt = before
+    if plan is not None and reason == "legacy":
+        log.info(
+            "sidechat prompt full key=%s reason=legacy prompt_chars=%s",
+            plan.get("ledger_key"), len(prompt),
+        )
+    if plan is not None:
+        plan["prompt_cursor"] = {
+            "sent_count": len(turns),
+            "sent_fp": message_fingerprint(turns),
+            "sent_system_fp": message_fingerprint(system),
+        }
+    return {
+        "prompt": prompt,
+        "sidechat": plan,
+        "mode": mode,
+        "reason": reason,
+        "omitted": omitted,
+    }
 
 
 # ------------------------- 工具调用（function calling）适配 -------------------------
@@ -1980,7 +2163,14 @@ async def chat_completions(
     `user=role:<slug>[:proj:<slug>]`）。都没有则每次新开 /thread/new。
     可选 `X-Muse-Conversation` 作为恢复键。账号仍只由旁聊台账选择。
     """
-    prompt = build_chat_prompt(req.messages) or (req.prompt or "").strip()
+    model = resolve_model(req.model, default="muse-spark")
+    timeout = int(req.timeout or CFG.chat_timeout)
+    role, project = _chat_dimensions(req, x_muse_role, x_muse_project)
+    client_id = _clean_client_id(x_muse_conversation)
+    acc, sidechat = _route_chat_account(role, project)
+    delivery = compose_chat_prompt(req.messages, sidechat)
+    prompt = delivery["prompt"] or (req.prompt or "").strip()
+    sidechat = delivery["sidechat"]
     if not prompt:
         raise HTTPException(400, "messages 为空")
 
@@ -1991,12 +2181,6 @@ async def chat_completions(
         # 放在末尾：开头是 agent 自己的 system 提示，夹在中间容易被忽略；
         # 紧贴用户消息之前，模型对末尾指令的遵守度明显更高。
         prompt = prompt + "\n\n" + tool_note
-
-    model = resolve_model(req.model, default="muse-spark")
-    timeout = int(req.timeout or CFG.chat_timeout)
-    role, project = _chat_dimensions(req, x_muse_role, x_muse_project)
-    client_id = _clean_client_id(x_muse_conversation)
-    acc, sidechat = _route_chat_account(role, project)
 
     cid = "chatcmpl-" + uuid.uuid4().hex[:24]
     created = int(time.time())
@@ -2177,15 +2361,16 @@ async def responses_api(
     可选 `X-Muse-Conversation` 作为恢复键。账号仍只由旁聊台账选择。
     """
     relay_messages = _responses_messages(req)
-    prompt = build_chat_prompt(relay_messages)
-    if not prompt:
-        raise HTTPException(400, "input 为空")
-
     model = resolve_model(req.model, default="muse-spark")
     timeout = int(req.timeout or CFG.chat_timeout)
     role, project = _chat_dimensions(req, x_muse_role, x_muse_project)
     client_id = _clean_client_id(x_muse_conversation)
     acc, sidechat = _route_chat_account(role, project)
+    delivery = compose_chat_prompt(relay_messages, sidechat)
+    prompt = delivery["prompt"]
+    sidechat = delivery["sidechat"]
+    if not prompt:
+        raise HTTPException(400, "input 为空")
 
     rid = "resp_" + uuid.uuid4().hex[:24]
     mid = "msg_" + uuid.uuid4().hex[:24]

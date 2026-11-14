@@ -102,7 +102,7 @@ Upload one product photo and get talking-head sales videos, story-style ad short
 4. **访问管理面板**：
    打开浏览器访问：`http://<你的服务器IP>:18610/admin?key=<你的MUSE2API_KEY>`
 
-   镜像构建会把 `sidechat.py`、`redact.py`、`relay.py` 和 `app.py`、`engine.py`、`config.py` 一起复制进容器。缺少 `sidechat.py` 时进程会在 `from sidechat import ...` 退出。
+   镜像构建会把 `sidechat.py`、`chat_extract.py`、`redact.py`、`relay.py` 和 `app.py`、`engine.py`、`config.py` 一起复制进容器。缺少 `sidechat.py` 或 `chat_extract.py` 时进程会在 import 时退出。
 
    默认 Compose 只挂载 `./data`。若要改这几个源文件后不重建镜像，可以在 `docker-compose.yml` 里按文件挂载（改完需要 `docker compose restart` 才会重新 import）：
 
@@ -111,6 +111,7 @@ Upload one product photo and get talking-head sales videos, story-style ad short
      - ./data:/app/data
      - ./app.py:/app/app.py
      - ./engine.py:/app/engine.py
+     - ./chat_extract.py:/app/chat_extract.py
      - ./config.py:/app/config.py
      - ./sidechat.py:/app/sidechat.py
      - ./redact.py:/app/redact.py
@@ -300,6 +301,12 @@ curl -X POST "http://localhost:18610/v1/chat/completions" \
 
 第一次使用某个键时，按映射选账号（映射的号不可用就换一个健康号），打开新旁聊，首条消息发出且 URL 变成 `/thread/<sessionId>` 后把 id 写回台账。之后同一键会打开这个 URL。打开失败、被重定向走，或气泡数达到 20，会把旧 id 记到 `prior_session_id` 并新建。账号禁用、重新导入 cookie、或会话认证失败时，该账号下的条目全部标 `stale`（session 不能换号接着用）。
 
+续用（`nav=resumed` / `reused`，台账里已有 `sessionId`）时，不再把全部 `messages` 粘成一段重发。条目上多三个可选字段：`sent_count`（已提交的非 system 轮次数）、`sent_fp`（这些轮次的 hash 前缀）、`sent_system_fp`（system/developer 的 hash 前缀）。请求里的轮次以前缀对上时，只把新增轮次发给 Muse；system 文本变了就带上最新的 system。对不上（历史被改写）会丢掉这个 `sessionId`、新开一条旁聊，并发送全量（截断规则见下），日志是 `sidechat prompt prefix mismatch`。旧条目没有这些字段时视为还没记过：这一轮仍打开原来的线程，但按全量发一次，成功后再补上指纹。指纹只在这轮确实吐出了回复之后写入；失败不推进，避免下一轮把没送出去的消息跳过。
+
+新旁聊、策略 A、切号后的新线程，以及上面的全量回退，仍发送整理后的历史，但有字符上限 `MUSE2API_MAX_PROMPT_CHARS`（默认 `200000`）。超过时保留 system、第一条 user 和最近的消息，中间换成一行 `[省略 N 条早期消息]`，并打 WARNING，里面有 `prompt_chars`（截断后实际发送的长度）和 `before_chars`。单条消息本身超过上限时无法再拆，会原样送出并同样告警。`MUSE2API_CONCURRENCY` 不变。
+
+助手回复不再只读最后一个气泡的 `innerText`。页面解密后的聊天 JSON（`delta.text_append` / `message_done` / 历史里最后一条 user 之后的助手消息）优先拼接成原始 markdown；拿不到时，把本轮新增的助手气泡按顺序用换行拼起来，代码块用 `<pre><code>` 的 `textContent` 还原围栏；再不行才用原来的最后一个气泡 `innerText`。日志只记 `chat extract method=` 和 `chars=`，不记正文、cookie 或密钥。下游要解析的 `CONNECTOR_CALL` JSON 走这条原文路径。
+
 配置映射（把 `example_acc_ops` 换成账号池里的真实 id）：
 
 ```bash
@@ -329,7 +336,7 @@ python tools/sidechat_ledger.py stale role:ops   # 手工标 stale
 
 ### 1.2 对话正文（relay.sqlite）
 
-旁聊 JSON 仍然只记 `session_id`、账号、`use_count`、`status`。用户消息和 Muse 回复写在 `data/relay.sqlite`（WAL）。不要把正文追加进 `sidechat_ledger.json`。
+旁聊 JSON 仍然只记 `session_id`、账号、`use_count`、`status`，外加可选的 `sent_count` / `sent_fp` / `sent_system_fp`（hash 前缀，不是正文）。用户消息和 Muse 回复写在 `data/relay.sqlite`（WAL）。不要把正文追加进 `sidechat_ledger.json`。
 
 客户端用请求头 `X-Muse-Conversation` 作为恢复键（Super Agent Engine 以后会传 `ticket.id`）。没有这个头时，每一轮只存本轮最后一条用户消息和回复。有这个头时，第一轮存 system 和第一条 user，之后只追加新消息，不把整段 `messages` 再写一遍。账号仍只由 `role_account_map` 和 `plan()` 决定，没有 `X-Muse-Account`。
 
@@ -347,6 +354,7 @@ python tools/sidechat_ledger.py stale role:ops   # 手工标 stale
 ```bash
 python tests/test_relay_ledger.py
 python tests/test_sidechat_ledger.py
+python tests/test_chat_fidelity.py
 ```
 
 这一层还没有部署到 192，需要操作员另行批准。P2（点选卡片）和 P3（加密填密钥）不在这次改动里。
@@ -503,6 +511,7 @@ Nginx 反代需把 `client_max_body_size` 调到 200M 左右，否则大素材�
 | `MUSE2API_IMAGE_TIMEOUT` | `240` | 生图超时上限（秒） |
 | `MUSE2API_VIDEO_TIMEOUT` | `600` | 生视频超时上限（秒） |
 | `MUSE2API_CHAT_TIMEOUT` | `300` | 对话生成超时上限（秒） |
+| `MUSE2API_MAX_PROMPT_CHARS` | `200000` | 新旁聊或全量历史的提示词字符上限。续用且前缀命中时只发新增消息。超过则保留 system、首条 user 和最近消息，中间写 `[省略 N 条早期消息]` |
 | `MUSE2API_REF_IMAGE_LOCAL_FILES` | `0` | 默认禁止读取服务器本地路径；仅可信单用户部署可显式设为 `1` 恢复 |
 | `MUSE2API_REF_IMAGE_PRIVATE_FETCH` | `0` | 默认仅允许公网 URL，并逐跳检查 DNS/重定向、固定已检查 IP、不使用环境代理；显式设为 `1` 才允许私网/本机 URL |
 
