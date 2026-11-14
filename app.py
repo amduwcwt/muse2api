@@ -682,6 +682,9 @@ class ImageRequest(BaseModel):
     files: list | None = None
     reference_image: str | None = None
     async_: bool = Field(False, alias="async")
+    # 钉号。slug 规则与对话相同；请求头 X-Muse-Role 优先于本字段。不写旁聊台账。
+    muse_role: str | None = None
+    muse_project: str | None = None
 
 
 class VideoRequest(BaseModel):
@@ -700,6 +703,9 @@ class VideoRequest(BaseModel):
     files: list | None = None
     image_url: Any = None
     reference_image: str | None = None
+    # 钉号。slug 规则与对话相同；请求头 X-Muse-Role 优先于本字段。不写旁聊台账。
+    muse_role: str | None = None
+    muse_project: str | None = None
 
 
 class ChatMessage(BaseModel):
@@ -1303,8 +1309,10 @@ def _run_generation(prompt: str, kind: str, timeout: int,
                     account_id: str | None = None, on_progress=None,
                     reference_image: str | None = None,
                     reference_images: list[str] | None = None,
-                    on_acquired=None) -> tuple[dict, str | None]:
+                    on_acquired=None, pinned: bool = False,
+                    pin_role: str | None = None) -> tuple[dict, str | None]:
     # Browser ownership covers account selection, retry and cleanup, not just generate().
+    # pinned 只限制账号选择：仍占用同一个 GEN_LOCK 槽，不改变全局并发。
     deadline = time.monotonic() + max(1, timeout)
     if not GEN_LOCK.acquire(timeout=max(1, timeout)):
         raise MuseGenerationError("等待浏览器队列超时，请稍后重试")
@@ -1316,21 +1324,42 @@ def _run_generation(prompt: str, kind: str, timeout: int,
                 pass
         return _run_generation_locked(prompt, kind, timeout, account_id,
                                       on_progress, reference_image, reference_images,
-                                      deadline=deadline)
+                                      deadline=deadline, pinned=pinned, pin_role=pin_role)
     finally:
         GEN_LOCK.release()
+
+
+def _pin_failure(pin_role: str | None, detail: str, exc_type=MuseGenerationError):
+    role_name = pin_role or "未知角色"
+    return exc_type(f"角色 {role_name} {detail}")
 
 
 def _run_generation_locked(prompt: str, kind: str, timeout: int,
                     account_id: str | None = None, on_progress=None,
                     reference_image: str | None = None,
                     reference_images: list[str] | None = None,
-                    deadline=None) -> tuple[dict, str | None]:
+                    deadline=None, pinned: bool = False,
+                    pin_role: str | None = None) -> tuple[dict, str | None]:
     remaining_wait = int(deadline - time.monotonic()) if deadline is not None else timeout
-    acc = ACCOUNT_POOL.acquire(account_id=account_id,
-                               preferred_id=None,
-                               rotate=True,
-                               timeout=max(1, remaining_wait))
+    if pinned and not account_id:
+        raise _pin_failure(pin_role, "已钉住账号，但没有账号 id，未切换到其他账号")
+    try:
+        acc = ACCOUNT_POOL.acquire(account_id=account_id,
+                                   preferred_id=None,
+                                   rotate=True,
+                                   timeout=max(1, remaining_wait))
+    except MuseAuthError as exc:
+        if not pinned:
+            raise
+        raise _pin_failure(
+            pin_role, "绑定的账号不存在或已禁用，未切换到其他账号", MuseAuthError,
+        ) from exc
+    except MuseGenerationError as exc:
+        if not pinned:
+            raise
+        raise _pin_failure(
+            pin_role, f"的账号在超时内没有空出来，未切换到其他账号: {exc}",
+        ) from exc
     cur_acc = acc
     last_exc = None
     try:
@@ -1347,13 +1376,38 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                 rem = int(deadline - time.monotonic()) if deadline is not None else timeout
                 if rem <= 0:
                     break
-                alt = ACCOUNT_POOL.acquire(rotate=True, force_rotate=True, timeout=rem)
-                if not alt or (old_id and alt["id"] == old_id):
-                    if alt:
-                        cur_acc = alt
-                    break
-                cur_acc = alt
-                log.info("【生图/视频自动切号】切换到备用账号 %s (%s) 重试...", cur_acc.get("label"), cur_acc["id"])
+                if pinned:
+                    # 钉住的角色只在同一个账号上再试一次，不 force_rotate 到别的号。
+                    try:
+                        alt = ACCOUNT_POOL.acquire(account_id=account_id,
+                                                   rotate=False,
+                                                   force_rotate=False,
+                                                   timeout=rem)
+                    except MuseAuthError as exc:
+                        raise _pin_failure(
+                            pin_role, "绑定的账号不存在或已禁用，未切换到其他账号",
+                            MuseAuthError,
+                        ) from exc
+                    except MuseGenerationError as exc:
+                        raise _pin_failure(
+                            pin_role, f"的账号仍不可用，未切换到其他账号: {exc}",
+                        ) from exc
+                    if not alt or alt.get("id") != account_id:
+                        if alt and alt.get("id"):
+                            ACCOUNT_POOL.release(alt.get("id"))
+                        raise _pin_failure(
+                            pin_role, "钉住的账号未能重试，未切换到其他账号",
+                        )
+                    cur_acc = alt
+                    log.info("【生图/视频钉号重试】仍使用账号 %s", cur_acc["id"])
+                else:
+                    alt = ACCOUNT_POOL.acquire(rotate=True, force_rotate=True, timeout=rem)
+                    if not alt or (old_id and alt["id"] == old_id):
+                        if alt:
+                            cur_acc = alt
+                        break
+                    cur_acc = alt
+                    log.info("【生图/视频自动切号】切换到备用账号 %s (%s) 重试...", cur_acc.get("label"), cur_acc["id"])
             try:
                 _bind_account_proxy(cur_acc)
                 refreshed = _renew_and_persist(cur_acc["id"], wake_vm=True, force=(attempt > 0))
@@ -1395,6 +1449,11 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
             except Exception as exc:  # noqa: BLE001
                 engine.close_current_page()
                 last_exc = MuseGenerationError(f"生成失败: {exc}")
+        if pinned and last_exc is not None:
+            raise _pin_failure(
+                pin_role, f"的生成失败，未切换到其他账号: {last_exc}",
+                last_exc.__class__,
+            ) from last_exc
         raise last_exc
     finally:
         if cur_acc:
@@ -1420,6 +1479,44 @@ def readyz():
 @app.get("/v1/models")
 def models(_=Depends(auth)):
     return {"object": "list", "data": MODELS}
+
+
+def _muse_media(role: str | None, account_id: str | None) -> dict:
+    """同步响应和任务记录只带角色与账号 id，不带 cookie、代理或标签。"""
+    if not isinstance(account_id, str) or not account_id.strip():
+        account_id = None
+    else:
+        account_id = account_id.strip()
+    return {"role": role, "account_id": account_id}
+
+
+def _media_pin(header_role, header_project, muse_role, muse_project):
+    """解析媒体请求的角色，并按台账 role_account_map 钉账号。
+
+    通过 ledger.snapshot() 按文件修改时间热加载，不创建旁聊条目。
+    没有角色，或角色和 default 都没有映射时，返回 (role, None)，调用方继续轮转。
+    映射的账号被禁用或不存在时直接报错，不换号。
+    """
+    try:
+        role, _project = resolve_dimensions(
+            header_role=header_role,
+            header_project=header_project,
+            muse_role=muse_role,
+            muse_project=muse_project,
+        )
+    except SidechatKeyError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if not role:
+        return None, None
+    role_map = ledger.snapshot().get("role_account_map") or {}
+    chosen = role_map.get(role) or role_map.get("default")
+    if not isinstance(chosen, str) or not chosen.strip():
+        return role, None
+    account_id = chosen.strip()
+    acc = store.get_account(account_id)
+    if not acc or not acc.get("enabled", True):
+        raise HTTPException(409, f"角色 {role} 绑定的账号不存在或已禁用")
+    return role, account_id
 
 
 # ------------------------- 生图 -------------------------
@@ -1460,13 +1557,15 @@ def _prepare_reference_images(images: list[str]) -> list[str]:
 
 
 def _queue_image(req: ImageRequest, prompt: str, reference_images: list[str],
-                 idempotency_key: str | None = None):
+                 idempotency_key: str | None = None, role: str | None = None,
+                 account_id: str | None = None):
     """Opt-in polling avoids reverse-proxy timeouts; no generation is repeated by polling."""
     if idempotency_key and len(idempotency_key) > 256:
         raise HTTPException(400, "Idempotency-Key too long")
     key_hash = hashlib.sha256(idempotency_key.encode()).hexdigest() if idempotency_key else None
     request_hash = hashlib.sha256(json.dumps(
-        {"request": req.model_dump(by_alias=True), "references": reference_images},
+        {"request": req.model_dump(by_alias=True), "references": reference_images,
+         "muse_role": role, "pinned_account_id": account_id},
         sort_keys=True, ensure_ascii=False).encode()).hexdigest()
     with IMAGE_TASK_LOCK:
         tasks = list(store.tasks.values())
@@ -1475,20 +1574,27 @@ def _queue_image(req: ImageRequest, prompt: str, reference_images: list[str],
                 if existing.get("image_request_key") == key_hash:
                     if existing.get("image_request_hash") != request_hash:
                         raise HTTPException(409, "Idempotency-Key reused with different request")
-                    return JSONResponse(status_code=202, content={
+                    replay = {
                         "id": existing["id"], "task_id": existing["id"],
                         "object": "image.task", "status": existing["status"],
                         "progress": existing.get("progress", 0),
-                        "created_at": existing["created_at"]})
+                        "created_at": existing["created_at"]}
+                    if existing.get("muse"):
+                        replay["muse"] = existing["muse"]
+                    return JSONResponse(status_code=202, content=replay)
         # ponytail: one Chromium worker; cap admission instead of adding a broker.
         if sum(t.get("kind") == "image" and t.get("status") in ("queued", "processing")
                for t in tasks) >= 8:
             raise HTTPException(429, "Image queue is full; retry later")
         task = store.create_task("image", req.prompt)
         tid = task["id"]
-        store.update_task(tid, api_prompt=prompt, size=req.size,
-                          response_format=req.response_format, progress=0,
-                          image_request_key=key_hash, image_request_hash=request_hash)
+        queued = {"api_prompt": prompt, "size": req.size,
+                  "response_format": req.response_format, "progress": 0,
+                  "image_request_key": key_hash, "image_request_hash": request_hash,
+                  "muse": _muse_media(role, account_id)}
+        if account_id:
+            queued["account"] = account_id
+        store.update_task(tid, **queued)
 
     def worker():
         timing = {"t0": time.time()}
@@ -1498,11 +1604,13 @@ def _queue_image(req: ImageRequest, prompt: str, reference_images: list[str],
         try:
             res, acc_id = _run_generation(
                 prompt, "image", req.timeout or CFG.image_timeout,
+                account_id=account_id, pinned=account_id is not None, pin_role=role,
                 reference_images=reference_images,
                 on_progress=lambda p: store.update_task(tid, progress=p),
                 on_acquired=_on_acquired)
             # Store only media metadata, not large base64 payloads or reference credentials.
             store.update_task(tid, status="completed", progress=100, account=acc_id,
+                              muse=_muse_media(role, acc_id),
                               elapsed=round(time.time() - timing["t0"], 1),
                               url=media_url(res["filename"]),
                               result={**{k: res[k] for k in ("filename", "size", "kind")},
@@ -1514,14 +1622,21 @@ def _queue_image(req: ImageRequest, prompt: str, reference_images: list[str],
     threading.Thread(target=worker, daemon=True).start()
     return JSONResponse(status_code=202, content={
         "id": tid, "task_id": tid, "object": "image.task", "status": "queued",
-        "progress": 0, "created_at": task["created_at"]})
+        "progress": 0, "created_at": task["created_at"],
+        "muse": _muse_media(role, account_id)})
 
 
 @app.post("/v1/images/tasks")
 def create_image_task(req: ImageRequest,
-                      idempotency_key: str | None = Header(default=None), _=Depends(auth)):
+                      idempotency_key: str | None = Header(default=None),
+                      x_muse_role: str | None = Header(default=None),
+                      x_muse_project: str | None = Header(default=None),
+                      _=Depends(auth)):
+    role, pinned_id = _media_pin(
+        x_muse_role, x_muse_project, req.muse_role, req.muse_project)
     refs = _prepare_reference_images(_image_references(req))
-    return _queue_image(req, build_image_prompt(req, _reference_kinds(refs)), refs, idempotency_key)
+    return _queue_image(req, build_image_prompt(req, _reference_kinds(refs)), refs,
+                        idempotency_key, role=role, account_id=pinned_id)
 
 
 @app.get("/v1/images/tasks/{task_id}")
@@ -1538,22 +1653,33 @@ def get_image_task(task_id: str, _=Depends(auth)):
 
 
 @app.post("/v1/images/generations")
-async def images_generations(req: ImageRequest, _=Depends(auth)):
+async def images_generations(
+    req: ImageRequest,
+    _=Depends(auth),
+    x_muse_role: str | None = Header(default=None),
+    x_muse_project: str | None = Header(default=None),
+):
+    role, pinned_id = _media_pin(
+        x_muse_role, x_muse_project, req.muse_role, req.muse_project)
     ref_images = await asyncio.to_thread(
         _prepare_reference_images, _image_references(req))
 
     prompt = build_image_prompt(req, _reference_kinds(ref_images))
     timeout = req.timeout or CFG.image_timeout
     if req.async_:
-        return _queue_image(req, prompt, ref_images)
+        return _queue_image(req, prompt, ref_images, role=role, account_id=pinned_id)
     try:
-        res, _acc = await asyncio.to_thread(
-            _run_generation, prompt, "image", timeout, reference_images=ref_images)
+        res, acc_id = await asyncio.to_thread(
+            _run_generation, prompt, "image", timeout,
+            account_id=pinned_id, pinned=pinned_id is not None, pin_role=role,
+            reference_images=ref_images)
     except MuseAuthError as exc:
         raise HTTPException(401, str(exc)) from exc
     except MuseGenerationError as exc:
         raise HTTPException(502, str(exc)) from exc
-    return _image_response(req, res)
+    body = _image_response(req, res)
+    body["muse"] = _muse_media(role, acc_id)
+    return body
 
 
 @app.post("/v1/images/edits")
@@ -1568,6 +1694,8 @@ async def images_edits(request: Request, _=Depends(auth)):
     timeout = None
     ref_image_data: list[str] = []
     async_mode = False
+    muse_role = None
+    muse_project = None
 
     if "multipart/form-data" in content_type:
         form = await request.form(
@@ -1584,6 +1712,8 @@ async def images_edits(request: Request, _=Depends(auth)):
                 timeout = int(timeout_val)
             except ValueError:
                 pass
+        muse_role = form.get("muse_role")
+        muse_project = form.get("muse_project")
         # image 可重复提交；video / audio / file 同样可重复，按字段顺序排在 image 之后
         img_fields = [(name, value) for name in ("image", "image[]", "video", "audio", "file")
                       for value in form.getlist(name)]
@@ -1618,6 +1748,8 @@ async def images_edits(request: Request, _=Depends(auth)):
         aspect_ratio = body.get("aspect_ratio")
         response_format = body.get("response_format") or "url"
         timeout = body.get("timeout")
+        muse_role = body.get("muse_role")
+        muse_project = body.get("muse_project")
         raw_images = body.get("images")
         if raw_images is not None and not isinstance(raw_images, list):
             raise HTTPException(400, "images 必须是数组")
@@ -1628,6 +1760,11 @@ async def images_edits(request: Request, _=Depends(auth)):
     if not prompt:
         prompt = "参考此图片并进行生图创作"
 
+    role, pinned_id = _media_pin(
+        request.headers.get("x-muse-role"),
+        request.headers.get("x-muse-project"),
+        muse_role, muse_project)
+
     req_obj = ImageRequest(
         prompt=prompt,
         model=model,
@@ -1636,6 +1773,7 @@ async def images_edits(request: Request, _=Depends(auth)):
         response_format=response_format,
         timeout=timeout,
         images=ref_image_data,
+        muse_role=role,
         **{"async": async_mode}
     )
     ref_image_data = await asyncio.to_thread(
@@ -1643,32 +1781,44 @@ async def images_edits(request: Request, _=Depends(auth)):
     full_prompt = build_image_prompt(req_obj, _reference_kinds(ref_image_data))
     gen_timeout = timeout or CFG.image_timeout
     if req_obj.async_:
-        return _queue_image(req_obj, full_prompt, ref_image_data)
+        return _queue_image(req_obj, full_prompt, ref_image_data,
+                            role=role, account_id=pinned_id)
     try:
-        res, _acc = await asyncio.to_thread(
+        res, acc_id = await asyncio.to_thread(
             _run_generation, full_prompt, "image", gen_timeout,
+            account_id=pinned_id, pinned=pinned_id is not None, pin_role=role,
             reference_images=ref_image_data)
     except MuseAuthError as exc:
         raise HTTPException(401, str(exc)) from exc
     except MuseGenerationError as exc:
         raise HTTPException(502, str(exc)) from exc
 
-    return _image_response(req_obj, res)
+    body = _image_response(req_obj, res)
+    body["muse"] = _muse_media(role, acc_id)
+    return body
 
 
 # ------------------------- 生视频（异步任务） -------------------------
 @app.post("/v1/videos")
 @app.post("/v1/videos/generations")
-async def create_video(req: VideoRequest, _=Depends(auth)):
+async def create_video(
+    req: VideoRequest,
+    _=Depends(auth),
+    x_muse_role: str | None = Header(default=None),
+    x_muse_project: str | None = Header(default=None),
+):
+    role, pinned_id = _media_pin(
+        x_muse_role, x_muse_project, req.muse_role, req.muse_project)
     ref_images = await asyncio.to_thread(
         _prepare_reference_images, _video_references(req))
 
     prompt = build_video_prompt(req, _reference_kinds(ref_images))
     timeout = req.timeout or CFG.video_timeout
     task = store.create_task("video", req.prompt)
-    store.update_task(task["id"], api_prompt=prompt)
-
-    store.update_task(task["id"], progress=10)
+    queued = {"api_prompt": prompt, "progress": 10, "muse": _muse_media(role, pinned_id)}
+    if pinned_id:
+        queued["account"] = pinned_id
+    store.update_task(task["id"], **queued)
 
     def worker():
         timing = {"t0": time.time()}
@@ -1678,10 +1828,13 @@ async def create_video(req: VideoRequest, _=Depends(auth)):
         try:
             def prog_cb(p):
                 store.update_task(task["id"], progress=p)
-            res, acc_id = _run_generation(prompt, "video", timeout, on_progress=prog_cb,
-                                          reference_images=ref_images, on_acquired=_on_acquired)
+            res, acc_id = _run_generation(
+                prompt, "video", timeout, on_progress=prog_cb,
+                reference_images=ref_images, on_acquired=_on_acquired,
+                account_id=pinned_id, pinned=pinned_id is not None, pin_role=role)
             vurl = media_url(res["filename"])
             store.update_task(task["id"], status="completed", progress=100, account=acc_id,
+                              muse=_muse_media(role, acc_id),
                               elapsed=round(time.time() - timing["t0"], 1),
                               url=vurl,
                               video={"url": vurl},
@@ -1694,7 +1847,8 @@ async def create_video(req: VideoRequest, _=Depends(auth)):
 
     threading.Thread(target=worker, daemon=True).start()
     return {"id": task["id"], "task_id": task["id"], "object": "video.task", "status": "queued",
-            "progress": 10, "created_at": task["created_at"]}
+            "progress": 10, "created_at": task["created_at"],
+            "muse": _muse_media(role, pinned_id)}
 
 
 @app.get("/v1/videos/{task_id}")
