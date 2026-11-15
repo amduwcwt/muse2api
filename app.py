@@ -40,6 +40,7 @@ from contextlib import contextmanager
 import base64
 import collections
 import binascii
+import errno
 import io
 import hashlib
 import json
@@ -52,6 +53,7 @@ import uuid
 import zipfile
 
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request
+from starlette.requests import ClientDisconnect
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
                                Response, StreamingResponse)
@@ -477,6 +479,16 @@ def _commit_sidechat(plan: dict | None, state: dict, account_id: str | None,
                      accept_cursor: bool = False) -> None:
     if not plan or plan.get("strategy") != "bc" or not plan.get("ledger_key"):
         return
+    # 无指纹长线程改开的新旁聊：只有新线程已经吐字才落台账。失败、续上旧线程、或还没吐字都不写。
+    if plan.get("prompt_reason") == "legacy_long":
+        nav = state.get("nav")
+        opened = nav in ("new", "fresh", "stale", "rollover") and bool(state.get("session_id"))
+        if not (accept_cursor and opened):
+            log.info(
+                "sidechat legacy long-thread skip ledger nav=%s captured=%s cursor=%s",
+                nav, bool(state.get("session_id")), int(bool(accept_cursor)),
+            )
+            return
     if state.get("nav") not in ("new", "fresh", "resumed", "reused", "stale", "rollover") \
             and not state.get("session_id"):
         return
@@ -507,21 +519,128 @@ def _commit_sidechat(plan: dict | None, state: dict, account_id: str | None,
         log.warning("sidechat record failed key=%s err=%s", plan.get("ledger_key"), exc)
 
 
+_CLIENT_GONE_ERRNO = {errno.EPIPE, errno.ECONNRESET, errno.ECONNABORTED, errno.ENOTCONN, errno.ESHUTDOWN}
+
+
+def _mark_client_gone(client_gone: threading.Event, stop_event: threading.Event, reason: str) -> None:
+    """客户端取消、断连或写不出去。只记原因，不记正文。"""
+    already = client_gone.is_set()
+    client_gone.set()
+    stop_event.set()
+    if not already:
+        log.info("chat client gone reason=%s", reason)
+
+
+def _spec_version(scope: dict) -> tuple:
+    raw = (scope.get("asgi") or {}).get("spec_version", "2.0")
+    try:
+        return tuple(int(part) for part in str(raw).split("."))
+    except ValueError:
+        return (2, 0)
+
+
+class _DisconnectStream(StreamingResponse):
+    """流式响应在客户端断开时立刻停下生成。
+
+    uvicorn 的 HTTP scope 低于 2.4，Starlette 会并行 listen_for_disconnect，
+    断开后取消正在写的响应。2.4 及以上没人读 receive，这里自己等 http.disconnect。
+    """
+
+    def __init__(self, content, client_gone: threading.Event, stop_event: threading.Event, **kwargs):
+        super().__init__(content, **kwargs)
+        self._client_gone = client_gone
+        self._stop_event = stop_event
+
+    async def listen_for_disconnect(self, receive):
+        try:
+            while True:
+                message = await receive()
+                if message.get("type") == "http.disconnect":
+                    _mark_client_gone(self._client_gone, self._stop_event, "disconnected")
+                    break
+        except asyncio.CancelledError:
+            raise
+
+    async def stream_response(self, send):
+        try:
+            await super().stream_response(send)
+        except asyncio.CancelledError:
+            _mark_client_gone(self._client_gone, self._stop_event, "cancelled")
+            raise
+        except ClientDisconnect:
+            _mark_client_gone(self._client_gone, self._stop_event, "disconnected")
+            raise
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            _mark_client_gone(self._client_gone, self._stop_event, "broken_pipe")
+            raise
+        except OSError as exc:
+            if getattr(exc, "errno", None) in _CLIENT_GONE_ERRNO:
+                _mark_client_gone(self._client_gone, self._stop_event, "broken_pipe")
+            raise
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") == "http" and _spec_version(scope) >= (2, 4):
+            watcher = asyncio.create_task(self.listen_for_disconnect(receive))
+            try:
+                await self.stream_response(send)
+            finally:
+                watcher.cancel()
+                try:
+                    await watcher
+                except asyncio.CancelledError:
+                    pass
+            if self.background is not None:
+                await self.background()
+            return
+        await super().__call__(scope, receive, send)
+
+
+async def _watch_request_disconnect(request: Request, client_gone: threading.Event,
+                                    stop_event: threading.Event) -> None:
+    """非流式请求没有 StreamingResponse 在听断开，这里阻塞等 http.disconnect。"""
+    try:
+        while not stop_event.is_set() and not client_gone.is_set():
+            message = await request.receive()
+            if isinstance(message, dict) and message.get("type") == "http.disconnect":
+                _mark_client_gone(client_gone, stop_event, "disconnected")
+                return
+    except asyncio.CancelledError:
+        return
+    except Exception as exc:  # noqa: BLE001
+        log.info("chat client watch ended err=%s", type(exc).__name__)
+
+
+async def _cancel_watch(watcher: asyncio.Task | None) -> None:
+    if watcher is None:
+        return
+    watcher.cancel()
+    try:
+        await watcher
+    except asyncio.CancelledError:
+        return
+
+
 def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                      timeout: int, account_id: str | None,
                      chat_model: str | None = None,
                      sidechat: dict | None = None,
                      on_finished=None, capture: dict | None = None,
                      full_prompt: str | None = None, full_omitted: int = 0,
-                     full_before_chars: int = 0, prompt_limit: int = 0):
+                     full_before_chars: int = 0, prompt_limit: int = 0,
+                     stop_event: threading.Event | None = None,
+                     client_gone: threading.Event | None = None):
     """在独立线程中执行 chat_stream 并持有 GEN_LOCK，通过 Queue 往外吐。
     无论下游客户端何时断连、异常或超时，stop_event + finally 块保证 100% 立即释放 GEN_LOCK，绝不死锁。
-    若首字前遇到单账号 VM 卡死或会话异常，自动切换下一个健康账号重试一次。
+    若首字前遇到单账号 VM 卡死或会话异常，且客户端还在，自动切换下一个健康账号重试一次。
+    客户端取消或断连时立刻停，不切号，也不改旁聊台账。
     换号时丢掉原来的 sessionId（旁聊不能跨账号续用）。
     一轮结束（含中断和异常）时调用 on_finished 一次。回调失败不影响吐字。"""
     import queue
     q = queue.Queue(maxsize=100)
-    stop_event = threading.Event()
+    if stop_event is None:
+        stop_event = threading.Event()
+    if client_gone is None:
+        client_gone = threading.Event()
 
     def worker():
         cur_id = account_id
@@ -561,9 +680,25 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
             except Exception as exc:  # noqa: BLE001
                 log.warning("relay hook failed err=%s", type(exc).__name__)
 
+        def client_left() -> bool:
+            return client_gone.is_set() or stop_event.is_set()
+
+        def emit(kind: str, val) -> bool:
+            while True:
+                if kind == "data" and client_left():
+                    return False
+                try:
+                    q.put((kind, val), timeout=0.2)
+                    return True
+                except queue.Full:
+                    if client_left():
+                        return False
+
         try:
             for attempt in range(2):
-                if stop_event.is_set():
+                if client_left():
+                    if attempt > 0:
+                        log.info("chat client gone skip failover")
                     return
                 if attempt > 0:
                     if leased_id:
@@ -597,14 +732,18 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                 state.clear()
                 reply_parts.clear()
                 try:
+                    if client_left():
+                        return
                     if cur_id:
                         _bind_account_proxy(store.get_account(cur_id) or {})
                         refreshed = _renew_and_persist(cur_id, wake_vm=True, force=(attempt > 0))
                         if refreshed:
                             cur_cookies = refreshed["cookies"]
                             cur_exp = refreshed.get("cookies_exp")
+                    if client_left():
+                        return
                     with GEN_LOCK:
-                        if stop_event.is_set():
+                        if client_left():
                             return
                         engine.start()
                         try:
@@ -618,15 +757,21 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                                 full_prompt=full_prompt, full_omitted=full_omitted,
                                 full_before_chars=full_before_chars,
                                 prompt_limit=prompt_limit,
+                                prompt_reason=(plan or {}).get("prompt_reason"),
                             ):
+                                if client_left():
+                                    return
                                 yielded = True
                                 reply_parts.append(chunk)
-                                q.put(("data", chunk))
-                                if stop_event.is_set():
-                                    _commit_sidechat(plan, state, cur_id, accept_cursor=True)
+                                if not emit("data", chunk):
+                                    return
+                                if client_left():
                                     return
                         finally:
                             warmup_sent = bool(getattr(engine, "chat_warmup_sent", False))
+                    if client_left():
+                        log.info("chat client gone skip ledger nav=%s", state.get("nav"))
+                        return
                     if cur_id:
                         store.mark(cur_id, True, "")
                         _sync_cookies(cur_id)
@@ -634,6 +779,9 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                     return
                 except MuseAuthError as exc:
                     last_exc = exc
+                    if client_left():
+                        log.info("chat client gone skip failover")
+                        return
                     if cur_id:
                         store.mark(cur_id, False, str(exc))
                         _invalidate_sidechats(cur_id, "auth")
@@ -642,6 +790,9 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                         break
                 except Exception as exc:
                     last_exc = exc
+                    if client_left():
+                        log.info("chat client gone skip failover")
+                        return
                     _commit_sidechat(plan, state, cur_id, accept_cursor=yielded)
                     try:
                         engine.reset_thread()
@@ -649,9 +800,11 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                         pass
                     if yielded:
                         break
-            if last_exc is not None:
+            if last_exc is not None and not client_left():
                 finish_relay()
                 q.put(("error", last_exc))
+            elif client_left():
+                log.info("chat client gone skip failover")
         finally:
             if leased_id:
                 ACCOUNT_POOL.release(leased_id)
@@ -671,6 +824,9 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                 raise val
             else:
                 break
+    except GeneratorExit:
+        _mark_client_gone(client_gone, stop_event, "generator_closed")
+        raise
     finally:
         stop_event.set()
 
@@ -1136,8 +1292,11 @@ def compose_chat_prompt(messages, sidechat: dict | None = None, *,
 
     旁聊续用且请求轮次以前缀对齐已发送指纹时，只发新增轮次；系统提示变了就带上最新的。
     指纹对不上（历史被改写）时清掉 session，改开新旁聊并发全量。
-    旧条目没有指纹时仍续用原线程，这一轮发全量，成功后再把指纹写回去。
-    全量超过 MUSE2API_MAX_PROMPT_CHARS 时截中间，并打 WARNING（含 prompt_chars）。
+    旧条目没有指纹、且全文放得进上限时，仍续用原线程，这一轮发全量，成功后再把指纹写回去。
+    没有指纹且全文会超过 MUSE2API_MAX_PROMPT_CHARS（会截断，omitted > 0）时，
+    不把截断后的全文倒进旧会话，改开新旁聊，只把截断后的全量发给新线程。
+    台账要等这条新线程成功吐字后再改，失败中途不动。
+    全量超过上限时截中间，并打 WARNING（含 prompt_chars）。
     """
     limit = CFG.max_prompt_chars if limit is None else int(limit)
     if limit <= 0:
@@ -1197,13 +1356,28 @@ def compose_chat_prompt(messages, sidechat: dict | None = None, *,
     # full_prompt 留给「组完增量之后又新开了线程」：切号、nav=new/fresh/stale/rollover。
     # 续用命中时不把它发出去，所以这里不为它单独告警。
     full_prompt, full_omitted, full_before = _render_limited_prompt(normalized, limit)
+    # 没指纹的旧线程已经长到会截断：不要把截断全文灌回原会话，改开新旁聊。
+    if (plan is not None and reason == "legacy"
+            and (full_omitted or full_before > limit)):
+        mode, reason = "full_new", "legacy_long"
+        retired = plan.get("session_id")
+        if retired:
+            plan["retire_session_id"] = retired
+        plan["session_id"] = None
+        plan["prompt_reason"] = "legacy_long"
+        plan["reason"] = "legacy_long"
     if mode == "incremental":
         prompt, omitted, before_chars = _render_limited_prompt(to_send, limit)
         _log_prompt_truncation(prompt, before_chars, omitted, limit)
     else:
         prompt, omitted = full_prompt, full_omitted
         _log_prompt_truncation(prompt, full_before, full_omitted, limit)
-    if plan is not None and reason == "legacy":
+    if plan is not None and reason == "legacy_long":
+        log.info(
+            "sidechat prompt legacy long-thread new key=%s prompt_chars=%s before_chars=%s omitted=%s limit=%s",
+            plan.get("ledger_key"), len(prompt), full_before, full_omitted, limit,
+        )
+    elif plan is not None and reason == "legacy":
         log.info(
             "sidechat prompt full key=%s reason=legacy prompt_chars=%s",
             plan.get("ledger_key"), len(prompt),
@@ -2180,6 +2354,7 @@ def _restore_payload(key: str) -> JSONResponse:
 @app.post("/v1/chat/completions")
 async def chat_completions(
     req: ChatRequest,
+    request: Request,
     _=Depends(auth),
     x_muse_role: str | None = Header(default=None),
     x_muse_project: str | None = Header(default=None),
@@ -2251,6 +2426,8 @@ async def chat_completions(
                 for i, c in enumerate(calls)]
         return [head, body]
 
+    stop_event = threading.Event()
+    client_gone = threading.Event()
     if req.stream:
         def sync_stream():
             try:
@@ -2260,6 +2437,7 @@ async def chat_completions(
                 stream_gen = safe_chat_stream(
                     cookies, prompt, expires, timeout, account_id=acc_id,
                     chat_model=model, sidechat=sidechat, on_finished=on_finished,
+                    stop_event=stop_event, client_gone=client_gone,
                     **thread_args)
                 if not tool_note:
                     for chunk in stream_gen:
@@ -2321,20 +2499,31 @@ async def chat_completions(
                 yield _sse({"error": {"message": f"内部错误: {exc}", "type": "server_error", "code": 500}})
         stream_headers = dict(_SSE_HEADERS)
         stream_headers.update(_muse_headers(pre))
-        return StreamingResponse(sync_stream(), media_type="text/event-stream", headers=stream_headers)
+        return _DisconnectStream(
+            sync_stream(), client_gone=client_gone, stop_event=stop_event,
+            media_type="text/event-stream", headers=stream_headers,
+        )
 
     def run() -> str:
         return "".join(safe_chat_stream(
             cookies, prompt, expires, timeout, account_id=acc_id,
             chat_model=model, sidechat=sidechat, on_finished=on_finished,
+            stop_event=stop_event, client_gone=client_gone,
             **thread_args))
 
+    watcher = asyncio.create_task(_watch_request_disconnect(request, client_gone, stop_event))
     try:
-        text = await asyncio.to_thread(run)
-    except MuseAuthError as exc:
-        raise HTTPException(401, str(exc), headers=_muse_headers(box.get("info")))
-    except MuseGenerationError as exc:
-        raise HTTPException(502, str(exc), headers=_muse_headers(box.get("info")))
+        try:
+            text = await asyncio.to_thread(run)
+        except asyncio.CancelledError:
+            _mark_client_gone(client_gone, stop_event, "cancelled")
+            raise
+        except MuseAuthError as exc:
+            raise HTTPException(401, str(exc), headers=_muse_headers(box.get("info")))
+        except MuseGenerationError as exc:
+            raise HTTPException(502, str(exc), headers=_muse_headers(box.get("info")))
+    finally:
+        await _cancel_watch(watcher)
 
     usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
     info = box.get("info")
@@ -2393,6 +2582,7 @@ def _sse_event(event: str, data: dict) -> str:
 @app.post("/v1/responses")
 async def responses_api(
     req: ResponsesRequest,
+    request: Request,
     _=Depends(auth),
     x_muse_role: str | None = Header(default=None),
     x_muse_project: str | None = Header(default=None),
@@ -2446,6 +2636,8 @@ async def responses_api(
             body["muse"] = muse
         return body
 
+    stop_event = threading.Event()
+    client_gone = threading.Event()
     if req.stream:
         def sync_stream():
             try:
@@ -2465,6 +2657,7 @@ async def responses_api(
                 for chunk in safe_chat_stream(
                         cookies, prompt, expires, timeout, account_id=acc_id,
                         chat_model=model, sidechat=sidechat, on_finished=on_finished,
+                        stop_event=stop_event, client_gone=client_gone,
                         **thread_args):
                     full += chunk
                     yield _sse_event("response.output_text.delta", {
@@ -2489,20 +2682,31 @@ async def responses_api(
                     "response": envelope("failed", info=box.get("info"))})
         stream_headers = dict(_SSE_HEADERS)
         stream_headers.update(_muse_headers(pre))
-        return StreamingResponse(sync_stream(), media_type="text/event-stream", headers=stream_headers)
+        return _DisconnectStream(
+            sync_stream(), client_gone=client_gone, stop_event=stop_event,
+            media_type="text/event-stream", headers=stream_headers,
+        )
 
     def run() -> str:
         return "".join(safe_chat_stream(
             cookies, prompt, expires, timeout, account_id=acc_id,
             chat_model=model, sidechat=sidechat, on_finished=on_finished,
+            stop_event=stop_event, client_gone=client_gone,
             **thread_args))
 
+    watcher = asyncio.create_task(_watch_request_disconnect(request, client_gone, stop_event))
     try:
-        text = await asyncio.to_thread(run)
-    except MuseAuthError as exc:
-        raise HTTPException(401, str(exc), headers=_muse_headers(box.get("info")))
-    except MuseGenerationError as exc:
-        raise HTTPException(502, str(exc), headers=_muse_headers(box.get("info")))
+        try:
+            text = await asyncio.to_thread(run)
+        except asyncio.CancelledError:
+            _mark_client_gone(client_gone, stop_event, "cancelled")
+            raise
+        except MuseAuthError as exc:
+            raise HTTPException(401, str(exc), headers=_muse_headers(box.get("info")))
+        except MuseGenerationError as exc:
+            raise HTTPException(502, str(exc), headers=_muse_headers(box.get("info")))
+    finally:
+        await _cancel_watch(watcher)
 
     return JSONResponse(envelope("completed", text, box.get("info")),
                         headers=_muse_headers(box.get("info")))

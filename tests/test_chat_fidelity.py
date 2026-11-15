@@ -3,12 +3,15 @@
 运行：python tests/test_chat_fidelity.py
 需要本机 node 来执行页面里的提取脚本。
 """
+import asyncio
 import json
 import logging
 import os
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -432,8 +435,10 @@ def test_failover_new_thread_uses_full_history():
         seeded = app.compose_chat_prompt(history, {
             "strategy": "bc", "ledger_key": "role:ops", "role": "ops",
             "session_id": "example-session-not-real", "sent_fp": None,
-        }, limit=limit)
+        }, limit=10 ** 9)
         assert seeded["reason"] == "legacy"
+        assert seeded["omitted"] == 0
+        assert seeded["sidechat"]["session_id"] == "example-session-not-real"
         ledger.record_result(
             ledger_key="role:ops", role="ops", project=None,
             account_id="acc-ops", session_id="example-session-not-real", nav="resumed",
@@ -510,23 +515,59 @@ def test_mismatch_and_legacy_full_truncation():
         plan = ledger.plan("ops", None, _accounts())
         assert plan["sent_fp"] is None
         assert plan["session_id"] == "example-session-not-real"
+        short = app.compose_chat_prompt([system, first, recent], plan, limit=limit)
+        assert short["reason"] == "legacy"
+        assert short["mode"] == "full"
+        assert short["omitted"] == 0
+        assert short["sidechat"]["session_id"] == "example-session-not-real"
+        assert "FIRST_KEEP" in short["prompt"] and "RECENT_KEEP" in short["prompt"]
+
         records.clear()
-        legacy = app.compose_chat_prompt(history, plan, limit=limit)
-        assert legacy["reason"] == "legacy"
-        assert legacy["mode"] == "full"
-        assert legacy["sidechat"]["session_id"] == "example-session-not-real"
+        legacy = app.compose_chat_prompt(history, ledger.plan("ops", None, _accounts()), limit=limit)
+        assert legacy["reason"] == "legacy_long"
+        assert legacy["mode"] == "full_new"
+        assert legacy["sidechat"]["session_id"] is None
+        assert legacy["sidechat"]["retire_session_id"] == "example-session-not-real"
+        assert legacy["sidechat"]["prompt_reason"] == "legacy_long"
         assert legacy["prompt"] == legacy["full_prompt"]
         assert "[省略 2 条早期消息]" in legacy["prompt"]
         assert "SYS_KEEP" in legacy["prompt"] and "FIRST_KEEP" in legacy["prompt"]
         assert "RECENT_KEEP" in legacy["prompt"]
         assert "DROP_ONE_" not in legacy["prompt"] and "DROP_TWO_" not in legacy["prompt"]
         logged = "\n".join(records)
+        assert "sidechat prompt legacy long-thread new" in logged
         assert "chat prompt truncated" in logged
         assert "prompt_chars=" in logged and "before_chars=" in logged
         assert "omitted=2" in logged and f"limit={limit}" in logged
-        assert "reason=legacy" in logged
         assert "DROP_ONE_" not in logged and "FIRST_KEEP" not in logged
+        assert "SYS_KEEP" not in logged
+        disk_before = json.loads(Path(path).read_text(encoding="utf-8"))
+        assert disk_before["entries"][0]["session_id"] == "example-session-not-real"
+        assert disk_before["entries"][0].get("sent_fp") in (None, "")
         assert ledger.plan("ops", None, _accounts())["sent_fp"] is None
+        assert ledger.plan("ops", None, _accounts())["session_id"] == "example-session-not-real"
+
+        records.clear()
+        choose = engine_mod.MuseEngine.prompt_for_nav
+        sent_new = choose(
+            legacy["prompt"], legacy["full_prompt"], "new",
+            omitted=legacy["full_omitted"], before_chars=legacy["full_before_chars"],
+            limit=legacy["limit"], reason="legacy_long",
+        )
+        assert sent_new == legacy["full_prompt"]
+        nav_log = "\n".join(records)
+        assert "sidechat prompt legacy long-thread new" in nav_log
+        assert "nav=new" in nav_log
+        assert "prompt_chars=" in nav_log and "before_chars=" in nav_log
+        assert "omitted=" in nav_log and f"limit={limit}" in nav_log
+        assert "DROP_ONE_" not in nav_log and "FIRST_KEEP" not in nav_log
+        try:
+            choose(legacy["prompt"], legacy["full_prompt"], "resumed", reason="legacy_long", limit=limit)
+            raise AssertionError("resumed legacy long thread should be refused")
+        except engine_mod.MuseGenerationError:
+            pass
+        assert "legacy long-thread refused" in "\n".join(records)
+        assert "nav=resumed" in "\n".join(records)
 
         old_ledger = app.ledger
         app.ledger = ledger
@@ -534,15 +575,64 @@ def test_mismatch_and_legacy_full_truncation():
             app._commit_sidechat(
                 legacy["sidechat"],
                 {"nav": "resumed", "session_id": "example-session-not-real"},
+                "acc-ops", accept_cursor=True,
+            )
+            kept = ledger.plan("ops", None, _accounts())
+            assert kept["sent_fp"] is None
+            assert kept["session_id"] == "example-session-not-real"
+            app._commit_sidechat(
+                legacy["sidechat"],
+                {"nav": "new", "session_id": "new-thread-example"},
+                "acc-ops", accept_cursor=False,
+            )
+            still = ledger.plan("ops", None, _accounts())
+            assert still["sent_fp"] is None
+            assert still["session_id"] == "example-session-not-real"
+            app._commit_sidechat(
+                short["sidechat"],
+                {"nav": "resumed", "session_id": "example-session-not-real"},
                 "acc-ops", accept_cursor=False,
             )
             assert ledger.plan("ops", None, _accounts())["sent_fp"] is None
             app._commit_sidechat(
-                legacy["sidechat"],
+                short["sidechat"],
                 {"nav": "resumed", "session_id": "example-session-not-real"},
                 "acc-ops", accept_cursor=True,
             )
-            assert ledger.plan("ops", None, _accounts())["sent_fp"] == legacy["sidechat"]["prompt_cursor"]["sent_fp"]
+            resumed = ledger.plan("ops", None, _accounts())
+            assert resumed["session_id"] == "example-session-not-real"
+            assert resumed["sent_fp"] == short["sidechat"]["prompt_cursor"]["sent_fp"]
+        finally:
+            app.ledger = old_ledger
+
+        # 短历史的成功回填已经写了指纹。长线程落账要在无指纹条目上验证，重新载入原始行。
+        Path(path).write_text(json.dumps({
+            "version": 1,
+            "entries": [{
+                "ledger_key": "role:ops", "role": "ops", "status": "active",
+                "muse_account_id": "acc-ops", "session_id": "example-session-not-real",
+                "use_count": 1,
+            }],
+            "role_account_map": {"ops": "acc-ops"},
+        }), encoding="utf-8")
+        ledger = SidechatLedger(path)
+        legacy = app.compose_chat_prompt(history, ledger.plan("ops", None, _accounts()), limit=limit)
+        assert legacy["reason"] == "legacy_long"
+        old_ledger = app.ledger
+        app.ledger = ledger
+        try:
+            app._commit_sidechat(
+                legacy["sidechat"],
+                {"nav": "new", "session_id": "new-thread-example"},
+                "acc-ops", accept_cursor=True,
+            )
+            opened = ledger.plan("ops", None, _accounts())
+            assert opened["session_id"] == "new-thread-example"
+            assert opened["sent_fp"] == legacy["sidechat"]["prompt_cursor"]["sent_fp"]
+            saved = json.loads(Path(path).read_text(encoding="utf-8"))["entries"][0]
+            assert saved["prior_session_id"] == "example-session-not-real"
+            assert saved["last_nav"] == "new"
+            assert saved["status"] == "active"
         finally:
             app.ledger = old_ledger
 
@@ -577,9 +667,411 @@ def test_mismatch_and_legacy_full_truncation():
     print("PASS: legacy truncation, yield cursor, mismatch full")
 
 
+_LEDGER_FIELDS = (
+    "session_id", "sent_fp", "sent_count", "sent_system_fp", "status",
+    "last_nav", "muse_account_id", "prior_session_id", "use_count",
+)
+
+
+def _ledger_view(path):
+    entry = json.loads(Path(path).read_text(encoding="utf-8"))["entries"][0]
+    return {key: entry.get(key) for key in _LEDGER_FIELDS}
+
+
+def _seed_ops_ledger(path):
+    ledger = SidechatLedger(path)
+    ledger.record_result(
+        ledger_key="role:ops", role="ops", project=None,
+        account_id="acc-ops", session_id="example-session-not-real", nav="resumed",
+    )
+    return ledger
+
+
+class _ChatRuntime:
+    """挡住浏览器和真实账号池，只观察切号与台账。"""
+
+    def __init__(self, chat_stream, ledger):
+        self.chat_stream = chat_stream
+        self.ledger = ledger
+        self.acquires = []
+        self._old = {}
+
+    def __enter__(self):
+        self._old = {
+            "start": app.engine.start,
+            "close": app.engine.close_current_page,
+            "reset": app.engine.reset_thread,
+            "stream": app.engine.chat_stream,
+            "acquire": app.ACCOUNT_POOL.acquire,
+            "release": app.ACCOUNT_POOL.release,
+            "renew": app._renew_and_persist,
+            "bind": app._bind_account_proxy,
+            "clear": app._clear_account_proxy,
+            "sync": app._sync_cookies,
+            "ledger": app.ledger,
+        }
+        app.engine.start = lambda *args, **kwargs: None
+        app.engine.close_current_page = lambda *args, **kwargs: None
+        app.engine.reset_thread = lambda *args, **kwargs: None
+        app.engine.chat_stream = self.chat_stream
+        app.engine.chat_warmup_sent = False
+
+        def acquire(account_id=None, **kwargs):
+            self.acquires.append(account_id or "rotate")
+            if account_id:
+                return {
+                    "id": account_id, "label": "ops",
+                    "cookies": {"hatch_sess": "cookie-secret-value"}, "cookies_exp": None,
+                }
+            return {
+                "id": "acc-backup", "label": "bak",
+                "cookies": {"hatch_sess": "cookie-secret-value"}, "cookies_exp": None,
+            }
+
+        app.ACCOUNT_POOL.acquire = acquire
+        app.ACCOUNT_POOL.release = lambda *args, **kwargs: None
+        app._renew_and_persist = lambda *args, **kwargs: None
+        app._bind_account_proxy = lambda *args, **kwargs: None
+        app._clear_account_proxy = lambda *args, **kwargs: None
+        app._sync_cookies = lambda *args, **kwargs: None
+        app.ledger = self.ledger
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        app.engine.start = self._old["start"]
+        app.engine.close_current_page = self._old["close"]
+        app.engine.reset_thread = self._old["reset"]
+        app.engine.chat_stream = self._old["stream"]
+        app.ACCOUNT_POOL.acquire = self._old["acquire"]
+        app.ACCOUNT_POOL.release = self._old["release"]
+        app._renew_and_persist = self._old["renew"]
+        app._bind_account_proxy = self._old["bind"]
+        app._clear_account_proxy = self._old["clear"]
+        app._sync_cookies = self._old["sync"]
+        app.ledger = self._old["ledger"]
+        return False
+
+
+def _drive_stream(gen, entered, timeout=4):
+    errors = []
+    chunks = []
+
+    def reader():
+        try:
+            for chunk in gen:
+                chunks.append(chunk)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    thread = threading.Thread(target=reader)
+    thread.start()
+    assert entered.wait(timeout), "chat_stream was not entered"
+    return thread, chunks, errors
+
+
+def _assert_quiet(records):
+    logged = "\n".join(records)
+    for secret in ("UNIQUE_PROMPT_DO_NOT_LOG_zz", "cookie-secret-value", "DROP_ONE_", "FIRST_KEEP"):
+        assert secret not in logged, secret
+    return logged
+
+
+def test_cancelled_stream_skips_failover_and_ledger():
+    logger, handler, records = _listen()
+    path = tempfile.mktemp(suffix=".json")
+    try:
+        ledger = _seed_ops_ledger(path)
+        before = _ledger_view(path)
+        entered = threading.Event()
+        stop = threading.Event()
+        gone = threading.Event()
+
+        def fake_chat_stream(*args, stop_event=None, sidechat_state=None, **kwargs):
+            entered.set()
+            try:
+                deadline = time.time() + 3
+                while time.time() < deadline:
+                    if stop_event is not None and stop_event.is_set():
+                        return
+                    time.sleep(0.01)
+                raise engine_mod.MuseGenerationError("等待助手回复超时")
+                yield "should-not-stream"
+            finally:
+                if sidechat_state is not None:
+                    sidechat_state["nav"] = "new"
+                    sidechat_state["session_id"] = "orphan-session-id"
+
+        plan = ledger.plan("ops", None, _accounts())
+        with _ChatRuntime(fake_chat_stream, ledger) as runtime:
+            gen = app.safe_chat_stream(
+                {"hatch_sess": "cookie-secret-value"}, "UNIQUE_PROMPT_DO_NOT_LOG_zz",
+                None, 30, account_id="acc-ops", sidechat=plan,
+                stop_event=stop, client_gone=gone,
+            )
+            thread, chunks, errors = _drive_stream(gen, entered)
+            app._mark_client_gone(gone, stop, "cancelled")
+            thread.join(4)
+            assert not thread.is_alive()
+            assert chunks == []
+            assert errors == []
+            assert runtime.acquires == ["acc-ops"]
+        assert _ledger_view(path) == before
+        logged = _assert_quiet(records)
+        assert "【对话自动切号】" not in logged
+        assert "chat client gone" in logged
+    finally:
+        logger.removeHandler(handler)
+        if os.path.exists(path):
+            os.remove(path)
+    print("PASS: cancelled stream skips failover and ledger")
+
+
+def test_disconnect_during_muse_error_skips_failover_and_ledger():
+    logger, handler, records = _listen()
+    path = tempfile.mktemp(suffix=".json")
+    try:
+        ledger = _seed_ops_ledger(path)
+        before = _ledger_view(path)
+        entered = threading.Event()
+        stop = threading.Event()
+        gone = threading.Event()
+
+        def fake_chat_stream(*args, stop_event=None, sidechat_state=None, **kwargs):
+            entered.set()
+            try:
+                while not (stop_event is not None and stop_event.is_set()):
+                    time.sleep(0.01)
+                raise engine_mod.MuseGenerationError("等待助手回复超时")
+                yield "nope"
+            finally:
+                if sidechat_state is not None:
+                    sidechat_state["nav"] = "new"
+                    sidechat_state["session_id"] = "orphan-session-id"
+
+        plan = ledger.plan("ops", None, _accounts())
+        with _ChatRuntime(fake_chat_stream, ledger) as runtime:
+            gen = app.safe_chat_stream(
+                {"hatch_sess": "cookie-secret-value"}, "UNIQUE_PROMPT_DO_NOT_LOG_zz",
+                None, 30, account_id="acc-ops", sidechat=plan,
+                stop_event=stop, client_gone=gone,
+            )
+            thread, chunks, errors = _drive_stream(gen, entered)
+            app._mark_client_gone(gone, stop, "disconnected")
+            thread.join(4)
+            assert not thread.is_alive()
+            assert chunks == []
+            assert errors == []
+            assert runtime.acquires == ["acc-ops"]
+        assert _ledger_view(path) == before
+        logged = _assert_quiet(records)
+        assert "【对话自动切号】" not in logged
+        assert "skip failover" in logged
+    finally:
+        logger.removeHandler(handler)
+        if os.path.exists(path):
+            os.remove(path)
+    print("PASS: disconnect during muse error skips failover and ledger")
+
+
+def test_connected_muse_failure_still_failovers():
+    logger, handler, records = _listen()
+    path = tempfile.mktemp(suffix=".json")
+    try:
+        ledger = _seed_ops_ledger(path)
+        entered = threading.Event()
+
+        def fake_chat_stream(*args, sidechat_state=None, **kwargs):
+            entered.set()
+            raise engine_mod.MuseGenerationError("vm stuck")
+            yield "nope"
+
+        plan = ledger.plan("ops", None, _accounts())
+        with _ChatRuntime(fake_chat_stream, ledger) as runtime:
+            gen = app.safe_chat_stream(
+                {"hatch_sess": "cookie-secret-value"}, "UNIQUE_PROMPT_DO_NOT_LOG_zz",
+                None, 5, account_id="acc-ops", sidechat=plan,
+            )
+            thread, _chunks, errors = _drive_stream(gen, entered)
+            thread.join(4)
+            assert not thread.is_alive()
+            assert errors and isinstance(errors[0], engine_mod.MuseGenerationError)
+            assert runtime.acquires == ["acc-ops", "rotate"]
+        logged = _assert_quiet(records)
+        assert "【对话自动切号】" in logged
+        assert "chat client gone" not in logged
+    finally:
+        logger.removeHandler(handler)
+        if os.path.exists(path):
+            os.remove(path)
+    print("PASS: connected muse failure still failovers")
+
+
+def test_legacy_long_failure_does_not_write_ledger():
+    logger, handler, records = _listen()
+    path = tempfile.mktemp(suffix=".json")
+    try:
+        ledger = _seed_ops_ledger(path)
+        before = _ledger_view(path)
+        system, first, drop_one, drop_two, recent = _history_parts()
+        history = [system, first, drop_one, drop_two, recent]
+        marker = app.ChatMessage(role="user", content="[省略 2 条早期消息]")
+        limit = _fit_limit([system, first, marker, recent])
+        delivery = app.compose_chat_prompt(history, ledger.plan("ops", None, _accounts()), limit=limit)
+        assert delivery["reason"] == "legacy_long"
+        assert _ledger_view(path) == before
+        entered = threading.Event()
+
+        def fake_chat_stream(*args, sidechat_state=None, **kwargs):
+            entered.set()
+            try:
+                raise engine_mod.MuseGenerationError("vm stuck")
+                yield "nope"
+            finally:
+                if sidechat_state is not None:
+                    sidechat_state["nav"] = "new"
+                    sidechat_state["session_id"] = "orphan-session-id"
+
+        with _ChatRuntime(fake_chat_stream, ledger) as runtime:
+            gen = app.safe_chat_stream(
+                {"hatch_sess": "cookie-secret-value"}, delivery["prompt"],
+                None, 5, account_id="acc-ops", sidechat=delivery["sidechat"],
+                full_prompt=delivery["full_prompt"], full_omitted=delivery["full_omitted"],
+                full_before_chars=delivery["full_before_chars"], prompt_limit=delivery["limit"],
+            )
+            thread, _chunks, errors = _drive_stream(gen, entered)
+            thread.join(4)
+            assert not thread.is_alive()
+            assert errors
+            assert runtime.acquires == ["acc-ops", "rotate"]
+        assert _ledger_view(path) == before
+        logged = _assert_quiet(records)
+        assert "【对话自动切号】" in logged
+        assert "DROP_ONE_" not in logged
+    finally:
+        logger.removeHandler(handler)
+        if os.path.exists(path):
+            os.remove(path)
+    print("PASS: legacy long failure does not write ledger")
+
+
+def test_legacy_long_success_writes_new_thread():
+    logger, handler, records = _listen()
+    path = tempfile.mktemp(suffix=".json")
+    try:
+        ledger = _seed_ops_ledger(path)
+        system, first, drop_one, drop_two, recent = _history_parts()
+        history = [system, first, drop_one, drop_two, recent]
+        marker = app.ChatMessage(role="user", content="[省略 2 条早期消息]")
+        limit = _fit_limit([system, first, marker, recent])
+        delivery = app.compose_chat_prompt(history, ledger.plan("ops", None, _accounts()), limit=limit)
+        entered = threading.Event()
+
+        def fake_chat_stream(*args, sidechat_state=None, **kwargs):
+            entered.set()
+            if sidechat_state is not None:
+                sidechat_state["nav"] = "new"
+                sidechat_state["session_id"] = "new-thread-example"
+            yield "ok"
+
+        with _ChatRuntime(fake_chat_stream, ledger) as runtime:
+            gen = app.safe_chat_stream(
+                {"hatch_sess": "cookie-secret-value"}, delivery["prompt"],
+                None, 5, account_id="acc-ops", sidechat=delivery["sidechat"],
+                full_prompt=delivery["full_prompt"], full_omitted=delivery["full_omitted"],
+                full_before_chars=delivery["full_before_chars"], prompt_limit=delivery["limit"],
+            )
+            thread, chunks, errors = _drive_stream(gen, entered)
+            thread.join(4)
+            assert not thread.is_alive()
+            assert errors == []
+            assert chunks == ["ok"]
+            assert runtime.acquires == ["acc-ops"]
+        saved = _ledger_view(path)
+        assert saved["session_id"] == "new-thread-example"
+        assert saved["prior_session_id"] == "example-session-not-real"
+        assert saved["sent_fp"] == delivery["sidechat"]["prompt_cursor"]["sent_fp"]
+        assert saved["last_nav"] == "new"
+        assert saved["status"] == "active"
+        assert saved["muse_account_id"] == "acc-ops"
+        logged = _assert_quiet(records)
+        assert "【对话自动切号】" not in logged
+        assert "DROP_ONE_" not in logged
+    finally:
+        logger.removeHandler(handler)
+        if os.path.exists(path):
+            os.remove(path)
+    print("PASS: legacy long success writes the new thread")
+
+
+def test_disconnect_response_marks_client_gone():
+    async def scenario():
+        stop = threading.Event()
+        gone = threading.Event()
+        quiet = threading.Event()
+        quiet_stop = threading.Event()
+
+        async def cancelled_receive():
+            raise asyncio.CancelledError()
+
+        quiet_response = app._DisconnectStream(
+            iter(()), client_gone=quiet, stop_event=quiet_stop, media_type="text/plain",
+        )
+        try:
+            await quiet_response.listen_for_disconnect(cancelled_receive)
+            raise AssertionError("cancelled listen should propagate")
+        except asyncio.CancelledError:
+            pass
+        assert not quiet.is_set()
+        assert not quiet_stop.is_set()
+
+        started = threading.Event()
+
+        def blocks():
+            started.set()
+            while not stop.is_set():
+                time.sleep(0.01)
+            yield "done"
+
+        response = app._DisconnectStream(
+            blocks(), client_gone=gone, stop_event=stop, media_type="text/plain",
+        )
+
+        async def receive():
+            await asyncio.sleep(0.05)
+            return {"type": "http.disconnect"}
+
+        async def send(_message):
+            return None
+
+        scope = {"type": "http", "asgi": {"version": "3.0", "spec_version": "2.3"}}
+        task = asyncio.create_task(response(scope, receive, send))
+        await asyncio.to_thread(started.wait, 2)
+        try:
+            await asyncio.wait_for(task, 3)
+        except BaseException:
+            pass
+        assert gone.is_set()
+        assert stop.is_set()
+        if not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    asyncio.run(scenario())
+    print("PASS: disconnect response marks client gone")
+
+
 if __name__ == "__main__":
     test_extract_preserves_connector_json()
     test_prompt_cursor_and_truncation()
     test_failover_new_thread_uses_full_history()
     test_mismatch_and_legacy_full_truncation()
+    test_cancelled_stream_skips_failover_and_ledger()
+    test_disconnect_during_muse_error_skips_failover_and_ledger()
+    test_connected_muse_failure_still_failovers()
+    test_legacy_long_failure_does_not_write_ledger()
+    test_legacy_long_success_writes_new_thread()
+    test_disconnect_response_marks_client_gone()
     print("ALL CHAT FIDELITY TESTS PASSED")
