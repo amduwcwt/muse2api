@@ -74,6 +74,24 @@ def _detect_chromium() -> str:
     return configured or "chromium"
 
 
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(str(_env(name, str(default))).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def concurrency_limit() -> int:
+    """MUSE2API_CONCURRENCY：正整数，或 auto（返回 0，表示按可用账号数动态取值）。"""
+    raw = str(_env("MUSE2API_CONCURRENCY", "8")).strip().lower()
+    if raw == "auto":
+        return 0
+    try:
+        return max(1, int(raw or "8"))
+    except ValueError:
+        return 8
+
+
 @dataclass
 class Config:
     base_dir: str = field(default_factory=lambda: _env("MUSE2API_HOME", _DEFAULT_BASE_DIR))
@@ -116,7 +134,14 @@ class Config:
     chat_timeout: int = field(default_factory=lambda: int(_env("MUSE2API_CHAT_TIMEOUT", "300")))
     # 新旁聊 / 全量历史的提示词字符上限。续用命中时只发新增消息，不走这条截断。
     max_prompt_chars: int = field(default_factory=lambda: max_prompt_chars())
-    max_concurrency: int = field(default_factory=lambda: max(1, int(_env("MUSE2API_CONCURRENCY", "8"))))
+    # 全局并发上限。整数=固定槽位；auto=按「启用且有 cookie、未标坏」的账号数动态取值。
+    # 同一账号同一时间只跑一个请求（AccountPoolManager），所以实际并行度不会超过可用号数。
+    max_concurrency: int = field(default_factory=lambda: concurrency_limit())
+    # auto 模式的硬上限（0=不限）。防止账号很多时同一浏览器开太多页把内存吃满。
+    concurrency_cap: int = field(default_factory=lambda: max(0, _int_env("MUSE2API_CONCURRENCY_MAX", 0)))
+    # 排队总时限（秒）：同旁聊排队 + 等账号空闲 + 等全局槽位共用一个截止时间。
+    # 超时返回 503 明确报错，不换号、不改台账。应小于调用方超时减去 chat_timeout。
+    queue_timeout: int = field(default_factory=lambda: max(1, _int_env("MUSE2API_QUEUE_TIMEOUT", 240)))
 
     # 参考图输入默认只允许调用方直接提供数据和公网 URL。
     # 仅可信单用户部署可显式设为 1 恢复服务器本地文件或私网抓取。

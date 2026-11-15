@@ -329,6 +329,15 @@ class MuseEngine:
         self._ensure_local().page = val
 
     @property
+    def chat_warmup_sent(self) -> bool:
+        """本线程这轮对话是否发过选卡热身。线程内状态，并发时互不覆盖。"""
+        return bool(getattr(self._ensure_local(), "chat_warmup_sent", False))
+
+    @chat_warmup_sent.setter
+    def chat_warmup_sent(self, val: bool):
+        self._ensure_local().chat_warmup_sent = bool(val)
+
+    @property
     def current_acc_id(self) -> str | None:
         return getattr(self._ensure_local(), "current_acc_id", None)
 
