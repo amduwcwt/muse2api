@@ -69,7 +69,7 @@ from store import Store, account_expiry, min_expiry
 from proxy import normalize_server, request_proxy_context, split_proxy_url
 from redact import redact_text
 from relay import RelayStore, content_hash
-from sidechat import SidechatKeyError, SidechatLedger, resolve_dimensions
+from sidechat import SidechatKeyError, SidechatLedger, ledger_key, resolve_dimensions
 
 import sys
 log = logging.getLogger("muse2api")
@@ -111,35 +111,60 @@ relay = RelayStore(
 
 class ConcurrencyLock:
     """多账号并发调度锁。
-    由 CFG.max_concurrency 限制最大并发槽位；
+    由 CFG.max_concurrency 限制最大并发槽位；limit_fn 不为空时每次取号现算上限
+    （MUSE2API_CONCURRENCY=auto：按可用账号数）。
     同时提供与标准 Lock 兼容的 acquire / release / locked 接口，
     确保向下兼容历史单锁断言与管理端操作。"""
-    def __init__(self, limit: int = 2):
-        self.limit = max(1, limit)
-        self._sem = threading.Semaphore(self.limit)
-        self._count_lock = threading.Lock()
+    def __init__(self, limit: int = 2, limit_fn=None, cap: int = 0):
+        self.limit = max(1, int(limit or 1))
+        self._limit_fn = limit_fn
+        self._cap = max(0, int(cap or 0))
+        self._cond = threading.Condition()
         self._active_count = 0
+
+    def current_limit(self) -> int:
+        value = self.limit
+        if self._limit_fn is not None:
+            try:
+                value = int(self._limit_fn())
+            except Exception:  # noqa: BLE001
+                value = self.limit
+        value = max(1, value)
+        if self._cap:
+            value = min(value, self._cap)
+        return value
+
+    @property
+    def active(self) -> int:
+        with self._cond:
+            return self._active_count
 
     def acquire(self, blocking: bool = True, timeout: float | None = -1) -> bool:
         if timeout is None:
             timeout = -1
-        if timeout < 0:
-            ok = self._sem.acquire(blocking=blocking)
-        else:
-            ok = self._sem.acquire(blocking=blocking, timeout=timeout)
-        if ok:
-            with self._count_lock:
-                self._active_count += 1
-        return ok
+        deadline = None if timeout < 0 else time.monotonic() + timeout
+        with self._cond:
+            while self._active_count >= self.current_limit():
+                if not blocking:
+                    return False
+                if deadline is None:
+                    self._cond.wait(0.5)
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._cond.wait(min(remaining, 0.5))
+            self._active_count += 1
+            return True
 
     def release(self):
-        with self._count_lock:
+        with self._cond:
             if self._active_count > 0:
                 self._active_count -= 1
-        self._sem.release()
+            self._cond.notify_all()
 
     def locked(self) -> bool:
-        with self._count_lock:
+        with self._cond:
             return self._active_count > 0
 
     def __enter__(self):
@@ -148,6 +173,90 @@ class ConcurrencyLock:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.release()
+
+
+class MuseQueueTimeout(MuseGenerationError):
+    """排队超时：同旁聊上一条没结束、账号忙或全局槽位满。不换号，不改台账。"""
+
+
+class SidechatLease:
+    """一个旁聊（ledger_key）的一次占用。release 幂等。"""
+    __slots__ = ("gate", "key", "acquired_at", "started", "released")
+
+    def __init__(self, gate, key):
+        self.gate = gate
+        self.key = key
+        self.acquired_at = time.monotonic()
+        self.started = False
+        self.released = False
+
+    def mark_started(self) -> None:
+        self.started = True
+
+    def release(self) -> None:
+        if self.gate is not None:
+            self.gate.release(self)
+
+    def release_if_unstarted(self) -> None:
+        if not self.started:
+            self.release()
+
+
+class SidechatGate:
+    """同一旁聊（role+project 台账 key）同一时间只放行一条请求。
+
+    从读台账（plan / 增量游标）一直占到这轮写回台账之后，避免第二条拿旧游标
+    重复发送或漏发。只排队，不换号。没开工就被丢掉的占用（客户端握手后立刻断开、
+    生成器从未执行）超过 unstarted_grace 秒会被回收，防止永久卡死。"""
+
+    def __init__(self, unstarted_grace: float = 60.0):
+        self._cond = threading.Condition()
+        self._held: dict[str, SidechatLease] = {}
+        self._waiting: dict[str, int] = {}
+        self.unstarted_grace = unstarted_grace
+
+    def acquire(self, key: str | None, deadline: float) -> SidechatLease:
+        if not key:
+            return SidechatLease(None, None)
+        with self._cond:
+            self._waiting[key] = self._waiting.get(key, 0) + 1
+            try:
+                while True:
+                    cur = self._held.get(key)
+                    if cur is not None and not cur.started \
+                            and time.monotonic() - cur.acquired_at > self.unstarted_grace:
+                        log.warning("sidechat gate reclaim unstarted lease key=%s", key)
+                        cur.released = True
+                        self._held.pop(key, None)
+                        cur = None
+                    if cur is None:
+                        lease = SidechatLease(self, key)
+                        self._held[key] = lease
+                        return lease
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise MuseQueueTimeout(
+                            f"旁聊 {key} 上一条消息还在处理，排队超时（{CFG.queue_timeout}s），未发送；请稍后重试")
+                    self._cond.wait(min(remaining, 0.5))
+            finally:
+                left = self._waiting.get(key, 1) - 1
+                if left > 0:
+                    self._waiting[key] = left
+                else:
+                    self._waiting.pop(key, None)
+
+    def release(self, lease: SidechatLease) -> None:
+        with self._cond:
+            if lease.released:
+                return
+            lease.released = True
+            if self._held.get(lease.key) is lease:
+                self._held.pop(lease.key, None)
+            self._cond.notify_all()
+
+    def snapshot(self) -> dict:
+        with self._cond:
+            return {"held": sorted(self._held), "waiting": dict(self._waiting)}
 
 
 class AccountPoolManager:
@@ -201,8 +310,19 @@ class AccountPoolManager:
             self.cond.notify_all()
 
 
-GEN_LOCK = ConcurrencyLock(limit=CFG.max_concurrency)
+def _usable_account_count() -> int:
+    """auto 并发：启用、有 cookie、没被标坏的账号数。VM 状态不持久化，这里不看。"""
+    return sum(1 for a in list(store.accounts)
+               if a.get("enabled", True) and a.get("cookies") and a.get("ok") is not False)
+
+
+GEN_LOCK = ConcurrencyLock(
+    limit=CFG.max_concurrency or 1,
+    limit_fn=None if CFG.max_concurrency else _usable_account_count,
+    cap=CFG.concurrency_cap,
+)
 ACCOUNT_POOL = AccountPoolManager(store)
+SIDECHAT_GATE = SidechatGate()
 IMAGE_TASK_LOCK = threading.Lock()
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -469,7 +589,12 @@ def _route_chat_account(role: str | None, project: str | None):
             if retired:
                 plan["retire_session_id"] = retired
         return acc, plan
-    acc = store.pick_account(rotate=True)
+    # 策略 A 没有绑定账号：先挑空闲的号，全忙再按原规则轮转（之后在 worker 里排队）。
+    with ACCOUNT_POOL.cond:
+        busy = set(ACCOUNT_POOL.busy_accounts)
+    acc = store.pick_account(rotate=True, exclude_ids=busy) if busy else None
+    if not acc:
+        acc = store.pick_account(rotate=True)
     if not acc:
         raise HTTPException(400, "没有可用账号，请先在管理页面导入 cookie")
     return acc, plan
@@ -620,6 +745,38 @@ async def _cancel_watch(watcher: asyncio.Task | None) -> None:
         return
 
 
+def _queue_left(deadline: float) -> float:
+    return max(0.0, deadline - time.monotonic())
+
+
+def _account_label(aid: str | None) -> str:
+    acc = store.get_account(aid) if aid else None
+    return (acc or {}).get("label") or (aid or "?")
+
+
+@contextmanager
+def _gen_slot(deadline: float):
+    """全局并发槽位，等到 deadline 为止。拿不到就报排队超时，不换号。"""
+    if not GEN_LOCK.acquire(timeout=_queue_left(deadline)):
+        raise MuseQueueTimeout(
+            f"全局并发已满（上限 {GEN_LOCK.current_limit()}），排队超时（{CFG.queue_timeout}s），"
+            "本条未发送；不会换号，请稍后重试")
+    try:
+        yield
+    finally:
+        GEN_LOCK.release()
+
+
+async def _enter_sidechat(role: str | None, project: str | None,
+                          deadline: float) -> SidechatLease:
+    """同一旁聊排队。无 role（策略 A，每次新线程）不排队。"""
+    key = ledger_key(role, project) if role else None
+    try:
+        return await asyncio.to_thread(SIDECHAT_GATE.acquire, key, deadline)
+    except MuseQueueTimeout as exc:
+        raise HTTPException(503, str(exc), headers={"Retry-After": "30"}) from exc
+
+
 def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                      timeout: int, account_id: str | None,
                      chat_model: str | None = None,
@@ -628,14 +785,20 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                      full_prompt: str | None = None, full_omitted: int = 0,
                      full_before_chars: int = 0, prompt_limit: int = 0,
                      stop_event: threading.Event | None = None,
-                     client_gone: threading.Event | None = None):
+                     client_gone: threading.Event | None = None,
+                     lease: "SidechatLease | None" = None,
+                     queue_deadline: float | None = None):
     """在独立线程中执行 chat_stream 并持有 GEN_LOCK，通过 Queue 往外吐。
     无论下游客户端何时断连、异常或超时，stop_event + finally 块保证 100% 立即释放 GEN_LOCK，绝不死锁。
     若首字前遇到单账号 VM 卡死或会话异常，且客户端还在，自动切换下一个健康账号重试一次。
     客户端取消或断连时立刻停，不切号，也不改旁聊台账。
     换号时丢掉原来的 sessionId（旁聊不能跨账号续用）。
-    一轮结束（含中断和异常）时调用 on_finished 一次。回调失败不影响吐字。"""
+    一轮结束（含中断和异常）时调用 on_finished 一次。回调失败不影响吐字。
+    排队（等本账号空闲、等全局槽位）共用 queue_deadline；超时报 MuseQueueTimeout，
+    不换号、不写台账。lease 是本旁聊的占用，worker 结束（台账已写回）后释放。"""
     import queue
+    if queue_deadline is None:
+        queue_deadline = time.monotonic() + CFG.queue_timeout
     q = queue.Queue(maxsize=100)
     if stop_event is None:
         stop_event = threading.Event()
@@ -725,7 +888,17 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                         if retired:
                             plan["retire_session_id"] = retired
                 elif cur_id:
-                    ACCOUNT_POOL.acquire(account_id=cur_id, timeout=timeout)
+                    try:
+                        ACCOUNT_POOL.acquire(account_id=cur_id,
+                                             timeout=_queue_left(queue_deadline))
+                    except MuseAuthError as exc:
+                        last_exc = exc
+                        break
+                    except MuseGenerationError:
+                        last_exc = MuseQueueTimeout(
+                            f"账号 {_account_label(cur_id)} 正在处理别的请求（同一账号同时只跑一个），"
+                            f"排队超时（{CFG.queue_timeout}s），本条未发送；不会换号，请稍后重试")
+                        break
                     leased_id = cur_id
 
                 yielded = False
@@ -742,7 +915,7 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                             cur_exp = refreshed.get("cookies_exp")
                     if client_left():
                         return
-                    with GEN_LOCK:
+                    with _gen_slot(queue_deadline):
                         if client_left():
                             return
                         engine.start()
@@ -777,6 +950,9 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                         _sync_cookies(cur_id)
                     _commit_sidechat(plan, state, cur_id, accept_cursor=yielded)
                     return
+                except MuseQueueTimeout as exc:
+                    last_exc = exc
+                    break
                 except MuseAuthError as exc:
                     last_exc = exc
                     if client_left():
@@ -811,8 +987,12 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
             engine.close_current_page()
             _clear_account_proxy()
             finish_relay()
+            if lease is not None:
+                lease.release()
             q.put(("done", None))
 
+    if lease is not None:
+        lease.mark_started()
     threading.Thread(target=worker, daemon=True).start()
 
     try:
@@ -2381,41 +2561,47 @@ async def chat_completions(
     timeout = int(req.timeout or CFG.chat_timeout)
     role, project = _chat_dimensions(req, x_muse_role, x_muse_project)
     client_id = _clean_client_id(x_muse_conversation)
-    acc, sidechat = _route_chat_account(role, project)
-    delivery = compose_chat_prompt(req.messages, sidechat)
-    prompt = delivery["prompt"] or (req.prompt or "").strip()
-    full_prompt = delivery.get("full_prompt") or prompt
-    sidechat = delivery["sidechat"]
-    if not prompt:
-        raise HTTPException(400, "messages 为空")
+    queue_deadline = time.monotonic() + CFG.queue_timeout
+    lease = await _enter_sidechat(role, project, queue_deadline)
+    try:
+        acc, sidechat = _route_chat_account(role, project)
+        delivery = compose_chat_prompt(req.messages, sidechat)
+        prompt = delivery["prompt"] or (req.prompt or "").strip()
+        full_prompt = delivery.get("full_prompt") or prompt
+        sidechat = delivery["sidechat"]
+        if not prompt:
+            raise HTTPException(400, "messages 为空")
 
-    # 工具调用协议默认不注入 —— 实测 muse.ai 的助手会明确拒绝输出"伪工具调用"，
-    # 注入反而污染正常回答；详见 config.py 的 tool_protocol 注释。
-    tool_note = build_tools_prompt(req.tools) if CFG.tool_protocol else ""
-    if tool_note:
-        # 放在末尾：开头是 agent 自己的 system 提示，夹在中间容易被忽略；
-        # 紧贴用户消息之前，模型对末尾指令的遵守度明显更高。
-        prompt = prompt + "\n\n" + tool_note
-        full_prompt = full_prompt + "\n\n" + tool_note
-    thread_args = _thread_prompt_args(delivery, full_prompt)
+        # 工具调用协议默认不注入 —— 实测 muse.ai 的助手会明确拒绝输出"伪工具调用"，
+        # 注入反而污染正常回答；详见 config.py 的 tool_protocol 注释。
+        tool_note = build_tools_prompt(req.tools) if CFG.tool_protocol else ""
+        if tool_note:
+            # 放在末尾：开头是 agent 自己的 system 提示，夹在中间容易被忽略；
+            # 紧贴用户消息之前，模型对末尾指令的遵守度明显更高。
+            prompt = prompt + "\n\n" + tool_note
+            full_prompt = full_prompt + "\n\n" + tool_note
+        thread_args = _thread_prompt_args(delivery, full_prompt)
 
-    cid = "chatcmpl-" + uuid.uuid4().hex[:24]
-    created = int(time.time())
-    acc_id = acc["id"]
-    cookies = acc["cookies"]
-    expires = acc.get("cookies_exp")
-    relay_messages = list(req.messages)
-    if not relay_messages and req.prompt:
-        relay_messages = [ChatMessage(role="user", content=req.prompt)]
-    pre = _relay_prepare(
-        client_id=client_id, client_supplied=bool(client_id), role=role, project=project,
-        sidechat=sidechat, model=model,
-    ) if req.stream else None
-    on_finished, box = _bind_relay_turn(
-        request_id=cid, model=model, role=role, project=project, sidechat=sidechat,
-        client_id=client_id, client_supplied=bool(client_id), messages=relay_messages,
-        prompt=prompt, conversation_id=(pre or {}).get("conversation_id"),
-    )
+        cid = "chatcmpl-" + uuid.uuid4().hex[:24]
+        created = int(time.time())
+        acc_id = acc["id"]
+        cookies = acc["cookies"]
+        expires = acc.get("cookies_exp")
+        relay_messages = list(req.messages)
+        if not relay_messages and req.prompt:
+            relay_messages = [ChatMessage(role="user", content=req.prompt)]
+        pre = _relay_prepare(
+            client_id=client_id, client_supplied=bool(client_id), role=role, project=project,
+            sidechat=sidechat, model=model,
+        ) if req.stream else None
+        on_finished, box = _bind_relay_turn(
+            request_id=cid, model=model, role=role, project=project, sidechat=sidechat,
+            client_id=client_id, client_supplied=bool(client_id), messages=relay_messages,
+            prompt=prompt, conversation_id=(pre or {}).get("conversation_id"),
+        )
+    except BaseException:
+        lease.release()
+        raise
 
     def tool_call_deltas(calls: list[dict]) -> list[list[dict]]:
         """按 OpenAI 习惯分两片发：先 id/name，再 arguments 全文。"""
@@ -2438,6 +2624,7 @@ async def chat_completions(
                     cookies, prompt, expires, timeout, account_id=acc_id,
                     chat_model=model, sidechat=sidechat, on_finished=on_finished,
                     stop_event=stop_event, client_gone=client_gone,
+                    lease=lease, queue_deadline=queue_deadline,
                     **thread_args)
                 if not tool_note:
                     for chunk in stream_gen:
@@ -2485,6 +2672,8 @@ async def chat_completions(
                                 "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}})
                 yield "data: [DONE]\n\n"
                 store.mark(acc_id, True, "")
+            except MuseQueueTimeout as exc:
+                yield _sse({"error": {"message": str(exc), "type": "server_error", "code": 503}})
             except MuseAuthError as exc:
                 store.mark(acc_id, False, str(exc))
                 yield _sse({"error": {"message": str(exc), "type": "auth_error", "code": 401}})
@@ -2497,6 +2686,8 @@ async def chat_completions(
                 yield _sse({"error": {"message": str(exc), "type": "server_error", "code": 502}})
             except Exception as exc:
                 yield _sse({"error": {"message": f"内部错误: {exc}", "type": "server_error", "code": 500}})
+            finally:
+                lease.release_if_unstarted()
         stream_headers = dict(_SSE_HEADERS)
         stream_headers.update(_muse_headers(pre))
         return _DisconnectStream(
@@ -2505,11 +2696,15 @@ async def chat_completions(
         )
 
     def run() -> str:
-        return "".join(safe_chat_stream(
-            cookies, prompt, expires, timeout, account_id=acc_id,
-            chat_model=model, sidechat=sidechat, on_finished=on_finished,
-            stop_event=stop_event, client_gone=client_gone,
-            **thread_args))
+        try:
+            return "".join(safe_chat_stream(
+                cookies, prompt, expires, timeout, account_id=acc_id,
+                chat_model=model, sidechat=sidechat, on_finished=on_finished,
+                stop_event=stop_event, client_gone=client_gone,
+                lease=lease, queue_deadline=queue_deadline,
+                **thread_args))
+        finally:
+            lease.release_if_unstarted()
 
     watcher = asyncio.create_task(_watch_request_disconnect(request, client_gone, stop_event))
     try:
@@ -2518,6 +2713,8 @@ async def chat_completions(
         except asyncio.CancelledError:
             _mark_client_gone(client_gone, stop_event, "cancelled")
             raise
+        except MuseQueueTimeout as exc:
+            raise HTTPException(503, str(exc), headers={"Retry-After": "30", **_muse_headers(box.get("info"))})
         except MuseAuthError as exc:
             raise HTTPException(401, str(exc), headers=_muse_headers(box.get("info")))
         except MuseGenerationError as exc:
@@ -2599,27 +2796,33 @@ async def responses_api(
     timeout = int(req.timeout or CFG.chat_timeout)
     role, project = _chat_dimensions(req, x_muse_role, x_muse_project)
     client_id = _clean_client_id(x_muse_conversation)
-    acc, sidechat = _route_chat_account(role, project)
-    delivery = compose_chat_prompt(relay_messages, sidechat)
-    prompt = delivery["prompt"]
-    sidechat = delivery["sidechat"]
-    thread_args = _thread_prompt_args(delivery, delivery.get("full_prompt") or prompt)
-    if not prompt:
-        raise HTTPException(400, "input 为空")
+    queue_deadline = time.monotonic() + CFG.queue_timeout
+    lease = await _enter_sidechat(role, project, queue_deadline)
+    try:
+        acc, sidechat = _route_chat_account(role, project)
+        delivery = compose_chat_prompt(relay_messages, sidechat)
+        prompt = delivery["prompt"]
+        sidechat = delivery["sidechat"]
+        thread_args = _thread_prompt_args(delivery, delivery.get("full_prompt") or prompt)
+        if not prompt:
+            raise HTTPException(400, "input 为空")
 
-    rid = "resp_" + uuid.uuid4().hex[:24]
-    mid = "msg_" + uuid.uuid4().hex[:24]
-    created = int(time.time())
-    acc_id, cookies, expires = acc["id"], acc["cookies"], acc.get("cookies_exp")
-    pre = _relay_prepare(
-        client_id=client_id, client_supplied=bool(client_id), role=role, project=project,
-        sidechat=sidechat, model=model,
-    ) if req.stream else None
-    on_finished, box = _bind_relay_turn(
-        request_id=rid, model=model, role=role, project=project, sidechat=sidechat,
-        client_id=client_id, client_supplied=bool(client_id), messages=relay_messages,
-        prompt=prompt, conversation_id=(pre or {}).get("conversation_id"),
-    )
+        rid = "resp_" + uuid.uuid4().hex[:24]
+        mid = "msg_" + uuid.uuid4().hex[:24]
+        created = int(time.time())
+        acc_id, cookies, expires = acc["id"], acc["cookies"], acc.get("cookies_exp")
+        pre = _relay_prepare(
+            client_id=client_id, client_supplied=bool(client_id), role=role, project=project,
+            sidechat=sidechat, model=model,
+        ) if req.stream else None
+        on_finished, box = _bind_relay_turn(
+            request_id=rid, model=model, role=role, project=project, sidechat=sidechat,
+            client_id=client_id, client_supplied=bool(client_id), messages=relay_messages,
+            prompt=prompt, conversation_id=(pre or {}).get("conversation_id"),
+        )
+    except BaseException:
+        lease.release()
+        raise
 
     def envelope(status: str, text: str = "", info: dict | None = None) -> dict:
         done = status == "completed"
@@ -2658,6 +2861,7 @@ async def responses_api(
                         cookies, prompt, expires, timeout, account_id=acc_id,
                         chat_model=model, sidechat=sidechat, on_finished=on_finished,
                         stop_event=stop_event, client_gone=client_gone,
+                        lease=lease, queue_deadline=queue_deadline,
                         **thread_args):
                     full += chunk
                     yield _sse_event("response.output_text.delta", {
@@ -2677,9 +2881,14 @@ async def responses_api(
                     "response": envelope("completed", full, box.get("info"))})
             except Exception as exc:  # noqa: BLE001
                 log.warning("responses stream failed err=%s", type(exc).__name__)
+                failed = envelope("failed", info=box.get("info"))
+                if isinstance(exc, MuseQueueTimeout):
+                    failed["error"] = {"code": "queue_timeout", "message": str(exc)}
                 yield _sse_event("response.failed", {
                     "type": "response.failed",
-                    "response": envelope("failed", info=box.get("info"))})
+                    "response": failed})
+            finally:
+                lease.release_if_unstarted()
         stream_headers = dict(_SSE_HEADERS)
         stream_headers.update(_muse_headers(pre))
         return _DisconnectStream(
@@ -2688,11 +2897,15 @@ async def responses_api(
         )
 
     def run() -> str:
-        return "".join(safe_chat_stream(
-            cookies, prompt, expires, timeout, account_id=acc_id,
-            chat_model=model, sidechat=sidechat, on_finished=on_finished,
-            stop_event=stop_event, client_gone=client_gone,
-            **thread_args))
+        try:
+            return "".join(safe_chat_stream(
+                cookies, prompt, expires, timeout, account_id=acc_id,
+                chat_model=model, sidechat=sidechat, on_finished=on_finished,
+                stop_event=stop_event, client_gone=client_gone,
+                lease=lease, queue_deadline=queue_deadline,
+                **thread_args))
+        finally:
+            lease.release_if_unstarted()
 
     watcher = asyncio.create_task(_watch_request_disconnect(request, client_gone, stop_event))
     try:
@@ -2701,6 +2914,8 @@ async def responses_api(
         except asyncio.CancelledError:
             _mark_client_gone(client_gone, stop_event, "cancelled")
             raise
+        except MuseQueueTimeout as exc:
+            raise HTTPException(503, str(exc), headers={"Retry-After": "30", **_muse_headers(box.get("info"))})
         except MuseAuthError as exc:
             raise HTTPException(401, str(exc), headers=_muse_headers(box.get("info")))
         except MuseGenerationError as exc:
@@ -2871,6 +3086,7 @@ def admin_status(_=Depends(auth)):
         "media_count": len(os.listdir(CFG.media_dir))
         if os.path.isdir(CFG.media_dir) else 0,
         "browser_running": bool(engine.proc and engine.proc.poll() is None),
+        "concurrency": _concurrency_status(),
         "essential_cookies": list(ESSENTIAL_COOKIES),
         "base_url": f"{base}/v1" if base else "",
         "config": {"site": CFG.site_url, "cdp_port": CFG.cdp_port,
@@ -2878,6 +3094,22 @@ def admin_status(_=Depends(auth)):
                    "video_timeout": CFG.video_timeout,
                    "host": CFG.host, "port": CFG.port,
                    "public_base": base},
+    }
+
+
+def _concurrency_status() -> dict:
+    """只读：并发配置与当前占用。不含 cookie。"""
+    with ACCOUNT_POOL.cond:
+        busy = sorted(ACCOUNT_POOL.busy_accounts)
+    return {
+        "mode": "fixed" if CFG.max_concurrency else "auto",
+        "limit": GEN_LOCK.current_limit(),
+        "cap": CFG.concurrency_cap,
+        "active": GEN_LOCK.active,
+        "busy_accounts": busy,
+        "usable_accounts": _usable_account_count(),
+        "queue_timeout": CFG.queue_timeout,
+        "sidechats": SIDECHAT_GATE.snapshot(),
     }
 
 
