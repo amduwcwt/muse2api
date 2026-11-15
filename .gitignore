@@ -33,6 +33,9 @@ wheels/
 data/accounts.json
 data/tasks.json
 data/sidechat_ledger.json
+data/relay.sqlite
+data/relay.sqlite-wal
+data/relay.sqlite-shm
 data/.installed_sha
 data/debug-*.json
 data/media/*

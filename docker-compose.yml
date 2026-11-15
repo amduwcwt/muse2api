@@ -17,6 +17,8 @@ services:
       - MUSE2API_IMAGE_TIMEOUT=240
       - MUSE2API_VIDEO_TIMEOUT=600
       - MUSE2API_CHAT_TIMEOUT=300
+      # 全量提示词字符上限。续用旁聊只发新增消息；不改并发。
+      - MUSE2API_MAX_PROMPT_CHARS=${MUSE2API_MAX_PROMPT_CHARS:-200000}
     volumes:
       # 持久化账号配置、任务日志及媒体文件
       - ./data:/app/data

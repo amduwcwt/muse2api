@@ -18,6 +18,12 @@ OpenAI 兼容:
   GET    /admin/sidechats           （旁聊台账，只读，无 cookie）
   POST   /admin/sidechats/cleanup   （按 7 天 / 每账号 20 条标 stale，不删 Muse 线程）
   POST   /admin/sidechats/stale     （按 ledger_key 手工标 stale）
+  GET    /admin/relay/conversations  （对话正文列表，Bearer）
+  GET    /admin/relay/conversations/{id}
+  GET    /admin/relay/conversations/{id}/export
+  GET    /admin/relay/export         （JSONL 流，不整库 dump）
+  POST   /admin/relay/cleanup
+  GET    /v1/conversations/messages  （按 X-Muse-Conversation 恢复，跳过 warmup）
   GET    /admin/tasks               （任务记录）
   DELETE /admin/tasks/{id}  |  POST /admin/tasks/clear
   GET    /admin/media  |  POST /admin/media/delete  |  DELETE /admin/media/{name}
@@ -59,6 +65,8 @@ from engine import (ESSENTIAL_COOKIES, MAX_REFERENCE_IMAGE_BYTES,
 from engine import MuseProxyError
 from store import Store, account_expiry, min_expiry
 from proxy import normalize_server, request_proxy_context, split_proxy_url
+from redact import redact_text
+from relay import RelayStore, content_hash
 from sidechat import SidechatKeyError, SidechatLedger, resolve_dimensions
 
 import sys
@@ -92,6 +100,11 @@ store = Store(CFG)
 engine = MuseEngine(CFG)
 engine.proxy_resolver = lambda aid: (store.get_account(aid) or {}).get("proxy")
 ledger = SidechatLedger(CFG.sidechat_ledger_file)
+relay = RelayStore(
+    CFG.relay_db_file,
+    retention_days=CFG.relay_retention_days,
+    max_bytes=CFG.relay_max_bytes,
+)
 
 
 class ConcurrencyLock:
@@ -460,7 +473,8 @@ def _route_chat_account(role: str | None, project: str | None):
     return acc, plan
 
 
-def _commit_sidechat(plan: dict | None, state: dict, account_id: str | None) -> None:
+def _commit_sidechat(plan: dict | None, state: dict, account_id: str | None,
+                     accept_cursor: bool = False) -> None:
     if not plan or plan.get("strategy") != "bc" or not plan.get("ledger_key"):
         return
     if state.get("nav") not in ("new", "fresh", "resumed", "reused", "stale", "rollover") \
@@ -480,6 +494,9 @@ def _commit_sidechat(plan: dict | None, state: dict, account_id: str | None) -> 
             nav=state.get("nav"),
             retire_session_id=plan.get("retire_session_id"),
             failover=bool(plan.get("failover") or state.get("nav") in ("stale", "rollover")),
+            sent_count=(plan.get("prompt_cursor") or {}).get("sent_count") if accept_cursor else None,
+            sent_fp=(plan.get("prompt_cursor") or {}).get("sent_fp") if accept_cursor else None,
+            sent_system_fp=(plan.get("prompt_cursor") or {}).get("sent_system_fp") if accept_cursor else None,
         )
         log.info(
             "sidechat key=%s account=%s nav=%s captured=%s",
@@ -493,11 +510,15 @@ def _commit_sidechat(plan: dict | None, state: dict, account_id: str | None) -> 
 def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                      timeout: int, account_id: str | None,
                      chat_model: str | None = None,
-                     sidechat: dict | None = None):
+                     sidechat: dict | None = None,
+                     on_finished=None, capture: dict | None = None,
+                     full_prompt: str | None = None, full_omitted: int = 0,
+                     full_before_chars: int = 0, prompt_limit: int = 0):
     """在独立线程中执行 chat_stream 并持有 GEN_LOCK，通过 Queue 往外吐。
     无论下游客户端何时断连、异常或超时，stop_event + finally 块保证 100% 立即释放 GEN_LOCK，绝不死锁。
     若首字前遇到单账号 VM 卡死或会话异常，自动切换下一个健康账号重试一次。
-    换号时丢掉原来的 sessionId（旁聊不能跨账号续用）。"""
+    换号时丢掉原来的 sessionId（旁聊不能跨账号续用）。
+    一轮结束（含中断和异常）时调用 on_finished 一次。回调失败不影响吐字。"""
     import queue
     q = queue.Queue(maxsize=100)
     stop_event = threading.Event()
@@ -510,6 +531,36 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
         leased_id = None
         plan = dict(sidechat) if sidechat else None
         state: dict = {}
+        reply_parts: list[str] = []
+        warmup_sent = False
+        started = time.time()
+        finished = False
+
+        def finish_relay():
+            nonlocal finished
+            if finished:
+                return
+            finished = True
+            err_text = None
+            if last_exc is not None:
+                err_text = str(last_exc)[:2000]
+            snap = {
+                "account_id": cur_id,
+                "warmup": warmup_sent,
+                "state": dict(state),
+                "reply": "".join(reply_parts),
+                "error": err_text,
+                "latency_ms": int((time.time() - started) * 1000),
+            }
+            if capture is not None:
+                capture.update(snap)
+            if on_finished is None:
+                return
+            try:
+                on_finished(snap)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("relay hook failed err=%s", type(exc).__name__)
+
         try:
             for attempt in range(2):
                 if stop_event.is_set():
@@ -544,6 +595,7 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
 
                 yielded = False
                 state.clear()
+                reply_parts.clear()
                 try:
                     if cur_id:
                         _bind_account_proxy(store.get_account(cur_id) or {})
@@ -555,23 +607,30 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                         if stop_event.is_set():
                             return
                         engine.start()
-                        for chunk in engine.chat_stream(
-                            cur_cookies, prompt, cur_exp, timeout,
-                            account_id=cur_id, stop_event=stop_event,
-                            chat_model=chat_model,
-                            session_id=(plan or {}).get("session_id"),
-                            sidechat_label=(plan or {}).get("label"),
-                            sidechat_state=state if plan else None,
-                        ):
-                            yielded = True
-                            q.put(("data", chunk))
-                            if stop_event.is_set():
-                                _commit_sidechat(plan, state, cur_id)
-                                return
+                        try:
+                            for chunk in engine.chat_stream(
+                                cur_cookies, prompt, cur_exp, timeout,
+                                account_id=cur_id, stop_event=stop_event,
+                                chat_model=chat_model,
+                                session_id=(plan or {}).get("session_id"),
+                                sidechat_label=(plan or {}).get("label"),
+                                sidechat_state=state,
+                                full_prompt=full_prompt, full_omitted=full_omitted,
+                                full_before_chars=full_before_chars,
+                                prompt_limit=prompt_limit,
+                            ):
+                                yielded = True
+                                reply_parts.append(chunk)
+                                q.put(("data", chunk))
+                                if stop_event.is_set():
+                                    _commit_sidechat(plan, state, cur_id, accept_cursor=True)
+                                    return
+                        finally:
+                            warmup_sent = bool(getattr(engine, "chat_warmup_sent", False))
                     if cur_id:
                         store.mark(cur_id, True, "")
                         _sync_cookies(cur_id)
-                    _commit_sidechat(plan, state, cur_id)
+                    _commit_sidechat(plan, state, cur_id, accept_cursor=yielded)
                     return
                 except MuseAuthError as exc:
                     last_exc = exc
@@ -583,7 +642,7 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                         break
                 except Exception as exc:
                     last_exc = exc
-                    _commit_sidechat(plan, state, cur_id)
+                    _commit_sidechat(plan, state, cur_id, accept_cursor=yielded)
                     try:
                         engine.reset_thread()
                     except Exception:
@@ -591,12 +650,14 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                     if yielded:
                         break
             if last_exc is not None:
+                finish_relay()
                 q.put(("error", last_exc))
         finally:
             if leased_id:
                 ACCOUNT_POOL.release(leased_id)
             engine.close_current_page()
             _clear_account_proxy()
+            finish_relay()
             q.put(("done", None))
 
     threading.Thread(target=worker, daemon=True).start()
@@ -961,6 +1022,219 @@ def build_chat_prompt(messages: list[ChatMessage]) -> str:
         label = "助手" if role == "assistant" else "用户"
         parts.append(f"{label}：\n{text}")
     return "\n\n".join(parts)
+
+
+def _msg_role(message) -> str:
+    if isinstance(message, dict):
+        return (message.get("role") or "").strip().lower()
+    return (getattr(message, "role", "") or "").strip().lower()
+
+
+def _msg_content(message):
+    if isinstance(message, dict):
+        return message.get("content")
+    return getattr(message, "content", None)
+
+
+def _msg_tool_calls(message):
+    if isinstance(message, dict):
+        return message.get("tool_calls")
+    return getattr(message, "tool_calls", None)
+
+
+def _as_chat_message(message) -> ChatMessage:
+    if isinstance(message, ChatMessage):
+        return message
+    return ChatMessage(
+        role=_msg_role(message) or "user",
+        content=_msg_content(message),
+        tool_calls=_msg_tool_calls(message),
+    )
+
+
+def _split_chat_messages(messages) -> tuple[list[ChatMessage], list[ChatMessage]]:
+    """system/developer 与其余轮次分开。游标只覆盖轮次，系统提示单独比较。"""
+    system, turns = [], []
+    for message in messages or []:
+        item = _as_chat_message(message)
+        if _msg_role(item) in ("system", "developer"):
+            system.append(item)
+        else:
+            turns.append(item)
+    return system, turns
+
+
+def message_fingerprint(messages) -> str:
+    """已提交消息的稳定指纹。只含 role / 文本 / tool_calls，不写进日志。"""
+    rows = []
+    for message in messages or []:
+        rows.append({
+            "role": _msg_role(message),
+            "content": _content_text(_msg_content(message)),
+            "tool_calls": _msg_tool_calls(message),
+        })
+    raw = json.dumps(rows, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _fit_chat_messages(messages: list[ChatMessage], limit: int) -> tuple[list[ChatMessage], int]:
+    """超长时保留 system、首条 user 和最近消息，中间换成一行省略说明。"""
+    if len(build_chat_prompt(messages)) <= limit:
+        return messages, 0
+    system, turns = _split_chat_messages(messages)
+    first_idx = next((i for i, item in enumerate(turns) if _msg_role(item) == "user"), None)
+    if first_idx is None:
+        first: list[ChatMessage] = []
+        head: list[ChatMessage] = []
+        tail = turns
+    else:
+        first = [turns[first_idx]]
+        head = turns[:first_idx]
+        tail = turns[first_idx + 1:]
+    last = [tail[-1]] if tail else []
+    middle = tail[:-1] if tail else []
+
+    def pack(keep: int) -> tuple[list[ChatMessage], int]:
+        recent = middle[-keep:] if keep else []
+        omitted = len(head) + len(middle) - keep
+        marker = [ChatMessage(role="user", content=f"[省略 {omitted} 条早期消息]")] if omitted else []
+        return system + first + marker + recent + last, omitted
+
+    lo, hi, best = 0, len(middle), 0
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        packed, _omitted = pack(mid)
+        if len(build_chat_prompt(packed)) <= limit:
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return pack(best)
+
+
+def _render_limited_prompt(messages: list[ChatMessage], limit: int) -> tuple[str, int, int]:
+    """返回 (提示词, 省略条数, 截断前字符数)。未超限时省略条数为 0。"""
+    before = build_chat_prompt(messages)
+    before_chars = len(before)
+    if before_chars <= limit:
+        return before, 0, before_chars
+    fitted, omitted = _fit_chat_messages(messages, limit)
+    return build_chat_prompt(fitted), omitted, before_chars
+
+
+def _log_prompt_truncation(prompt: str, before_chars: int, omitted: int, limit: int) -> None:
+    if omitted or before_chars > limit:
+        log.warning(
+            "chat prompt truncated prompt_chars=%s before_chars=%s omitted=%s limit=%s",
+            len(prompt), before_chars, omitted, limit,
+        )
+
+
+def compose_chat_prompt(messages, sidechat: dict | None = None, *,
+                        limit: int | None = None) -> dict:
+    """决定这一轮发给 Muse 的提示词。
+
+    旁聊续用且请求轮次以前缀对齐已发送指纹时，只发新增轮次；系统提示变了就带上最新的。
+    指纹对不上（历史被改写）时清掉 session，改开新旁聊并发全量。
+    旧条目没有指纹时仍续用原线程，这一轮发全量，成功后再把指纹写回去。
+    全量超过 MUSE2API_MAX_PROMPT_CHARS 时截中间，并打 WARNING（含 prompt_chars）。
+    """
+    limit = CFG.max_prompt_chars if limit is None else int(limit)
+    if limit <= 0:
+        limit = 200000
+    normalized = [_as_chat_message(m) for m in (messages or [])]
+    if not normalized:
+        # 没有 messages 时不要因为对不上指纹就把还在用的旁聊清掉。
+        return {
+            "prompt": "",
+            "full_prompt": "",
+            "sidechat": sidechat,
+            "mode": "full",
+            "reason": "empty",
+            "omitted": 0,
+            "full_omitted": 0,
+            "full_before_chars": 0,
+            "limit": limit,
+        }
+    system, turns = _split_chat_messages(normalized)
+    plan = dict(sidechat) if sidechat else None
+    mode, reason = "full", "anonymous" if plan is None else "new"
+    to_send = normalized
+    if plan and plan.get("session_id"):
+        stored_fp = plan.get("sent_fp") if isinstance(plan.get("sent_fp"), str) else None
+        stored_count = plan.get("sent_count")
+        prefix_ok = False
+        if stored_fp and isinstance(stored_count, int) and not isinstance(stored_count, bool):
+            if 0 <= stored_count <= len(turns) and message_fingerprint(turns[:stored_count]) == stored_fp:
+                prefix_ok = True
+        if stored_fp is None or not isinstance(stored_count, int) or isinstance(stored_count, bool):
+            mode, reason = "full", "legacy"
+        elif prefix_ok:
+            mode, reason = "incremental", "resume"
+            new_turns = turns[stored_count:]
+            system_fp = message_fingerprint(system)
+            include_system = system_fp != (plan.get("sent_system_fp") or "")
+            chosen_system = system if include_system else []
+            chosen_turns = list(new_turns)
+            if not chosen_turns and not include_system:
+                last_user = next((item for item in reversed(turns) if _msg_role(item) == "user"), None)
+                chosen_turns = [last_user] if last_user is not None else (turns[-1:] if turns else [])
+                log.info(
+                    "sidechat prompt delta empty key=%s action=resend_last",
+                    plan.get("ledger_key"),
+                )
+            to_send = chosen_system + chosen_turns
+        else:
+            mode, reason = "full_new", "mismatch"
+            log.warning(
+                "sidechat prompt prefix mismatch key=%s sent_count=%s action=new_thread",
+                plan.get("ledger_key"), stored_count,
+            )
+            plan["retire_session_id"] = plan.get("session_id")
+            plan["session_id"] = None
+            to_send = normalized
+
+    # full_prompt 留给「组完增量之后又新开了线程」：切号、nav=new/fresh/stale/rollover。
+    # 续用命中时不把它发出去，所以这里不为它单独告警。
+    full_prompt, full_omitted, full_before = _render_limited_prompt(normalized, limit)
+    if mode == "incremental":
+        prompt, omitted, before_chars = _render_limited_prompt(to_send, limit)
+        _log_prompt_truncation(prompt, before_chars, omitted, limit)
+    else:
+        prompt, omitted = full_prompt, full_omitted
+        _log_prompt_truncation(prompt, full_before, full_omitted, limit)
+    if plan is not None and reason == "legacy":
+        log.info(
+            "sidechat prompt full key=%s reason=legacy prompt_chars=%s",
+            plan.get("ledger_key"), len(prompt),
+        )
+    if plan is not None:
+        plan["prompt_cursor"] = {
+            "sent_count": len(turns),
+            "sent_fp": message_fingerprint(turns),
+            "sent_system_fp": message_fingerprint(system),
+        }
+    return {
+        "prompt": prompt,
+        "full_prompt": full_prompt,
+        "sidechat": plan,
+        "mode": mode,
+        "reason": reason,
+        "omitted": omitted,
+        "full_omitted": full_omitted,
+        "full_before_chars": full_before,
+        "limit": limit,
+    }
+
+
+def _thread_prompt_args(delivery: dict, full_prompt: str) -> dict:
+    """交给 chat_stream：新开线程时用截断后的全量，而不是已经组好的增量。"""
+    return {
+        "full_prompt": full_prompt,
+        "full_omitted": int(delivery.get("full_omitted") or 0),
+        "full_before_chars": int(delivery.get("full_before_chars") or 0),
+        "prompt_limit": int(delivery.get("limit") or 0),
+    }
 
 
 # ------------------------- 工具调用（function calling）适配 -------------------------
@@ -1714,12 +1988,202 @@ _SSE_HEADERS = {
 }
 
 
+_CLIENT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,127}$")
+
+
+def _clean_client_id(value: str | None) -> str | None:
+    """X-Muse-Conversation 是客户端的恢复键（以后 Engine 会传 ticket.id）。空值当作没传。"""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise HTTPException(400, "X-Muse-Conversation 必须是字符串")
+    text = value.strip()
+    if not text:
+        return None
+    if not _CLIENT_ID.fullmatch(text):
+        raise HTTPException(400, "X-Muse-Conversation 只能是 1–128 位字母、数字或 _.:@-")
+    return text
+
+
+def _prompt_summary(prompt: str) -> tuple[int, str]:
+    redacted = redact_text(prompt or "")
+    return len(prompt or ""), content_hash(redacted)
+
+
+def _relay_messages(messages) -> list[dict]:
+    rows = []
+    for message in messages or []:
+        if isinstance(message, dict):
+            rows.append({
+                "role": message.get("role"),
+                "content": message.get("content"),
+                "tool_calls": message.get("tool_calls"),
+            })
+            continue
+        rows.append({
+            "role": getattr(message, "role", None),
+            "content": getattr(message, "content", None),
+            "tool_calls": getattr(message, "tool_calls", None),
+        })
+    return rows
+
+
+def _muse_body(info: dict | None) -> dict | None:
+    if not info or not info.get("conversation_id"):
+        return None
+    return {
+        "conversation_id": info.get("conversation_id"),
+        "client_id": info.get("client_id"),
+        "session_id": info.get("session_id"),
+        "nav": info.get("nav"),
+        "account_id": info.get("account_id"),
+        "ledger_key": info.get("ledger_key"),
+    }
+
+
+def _muse_headers(info: dict | None) -> dict:
+    body = _muse_body(info)
+    if not body:
+        return {}
+    headers = {
+        "X-Muse-Conversation-Id": body["conversation_id"],
+        "X-Muse-Conversation": body.get("client_id") or body["conversation_id"],
+    }
+    if body.get("session_id"):
+        headers["X-Muse-Session-Id"] = str(body["session_id"])
+    if body.get("nav"):
+        headers["X-Muse-Nav"] = str(body["nav"])
+    if body.get("account_id"):
+        headers["X-Muse-Account-Id"] = str(body["account_id"])
+    return headers
+
+
+def _persist_chat_turn(*, request_id, model, role, project, sidechat, client_id,
+                       client_supplied, messages, prompt, snap, conversation_id=None):
+    """落盘失败只记请求号和异常类型。日志里不放 prompt / 回复正文。"""
+    try:
+        state = (snap or {}).get("state") or {}
+        plan = sidechat or {}
+        account_id = (snap or {}).get("account_id") or plan.get("account_id")
+        account = store.get_account(account_id) if account_id else None
+        label = (account or {}).get("label") or plan.get("account_label") or ""
+        prompt_chars, prompt_digest = _prompt_summary(prompt or "")
+        info = relay.record_turn(
+            messages=_relay_messages(messages),
+            reply=(snap or {}).get("reply") or "",
+            error=(snap or {}).get("error"),
+            client_id=client_id,
+            client_supplied=bool(client_supplied),
+            conversation_id=conversation_id,
+            ledger_key=plan.get("ledger_key"),
+            role=role if role is not None else plan.get("role"),
+            project=project if project is not None else plan.get("project"),
+            account_id=account_id,
+            account_label=label,
+            session_id=state.get("session_id") or plan.get("session_id"),
+            model=model,
+            nav=state.get("nav"),
+            request_id=request_id,
+            latency_ms=(snap or {}).get("latency_ms"),
+            warmup=bool((snap or {}).get("warmup")),
+            prompt_chars=prompt_chars,
+            prompt_hash=prompt_digest,
+        )
+        log.info(
+            "relay persist conv=%s client=%s nav=%s prompt_chars=%s prompt_hash=%s reply_chars=%s",
+            info.get("conversation_id"), info.get("client_id") or "",
+            info.get("nav") or "", info.get("prompt_chars"), info.get("prompt_hash"),
+            info.get("reply_chars"),
+        )
+        return info
+    except Exception as exc:  # noqa: BLE001
+        log.warning("relay persist failed request=%s err=%s", request_id, type(exc).__name__)
+        return None
+
+
+def _relay_prepare(*, client_id, client_supplied, role, project, sidechat, model):
+    plan = sidechat or {}
+    try:
+        return relay.ensure_conversation(
+            client_id=client_id,
+            client_supplied=bool(client_supplied),
+            ledger_key=plan.get("ledger_key"),
+            role=role if role is not None else plan.get("role"),
+            project=project if project is not None else plan.get("project"),
+            account_id=plan.get("account_id"),
+            account_label=plan.get("account_label"),
+            session_id=plan.get("session_id"),
+            model=model,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log.warning("relay prepare failed err=%s", type(exc).__name__)
+        return None
+
+
+def _bind_relay_turn(**kwargs):
+    box: dict = {}
+
+    def on_finished(snap):
+        box["info"] = _persist_chat_turn(snap=snap, **kwargs)
+
+    return on_finished, box
+
+
+def _chat_json(payload: dict, info: dict | None):
+    muse = _muse_body(info)
+    if muse:
+        payload = dict(payload)
+        payload["muse"] = muse
+    return JSONResponse(payload, headers=_muse_headers(info))
+
+
+def _finish_chunk(cid, created, model, finish, info, delta=None):
+    chunk = _chat_chunk(cid, created, model, delta or {}, finish=finish)
+    muse = _muse_body(info)
+    if muse:
+        chunk["muse"] = muse
+    return chunk
+
+
+def _restore_key(path_id: str | None, header: str | None) -> str:
+    header_id = _clean_client_id(header) if header else None
+    cleaned = _clean_client_id(path_id) if path_id is not None else None
+    if cleaned and header_id and cleaned != header_id:
+        raise HTTPException(400, "X-Muse-Conversation 与路径中的对话 id 不一致")
+    key = cleaned or header_id
+    if not key:
+        raise HTTPException(400, "缺少 X-Muse-Conversation")
+    return key
+
+
+def _restore_payload(key: str) -> JSONResponse:
+    found = relay.lookup(key)
+    if not found:
+        raise HTTPException(404, "没有这通对话")
+    messages = relay.messages_for(found["id"], restore=True)
+    body = {
+        "conversation_id": found.get("id"),
+        "client_id": found.get("client_id"),
+        "session_id": found.get("session_id"),
+        "nav": found.get("last_nav"),
+        "model": found.get("model"),
+        "account_id": found.get("account_id"),
+        "ledger_key": found.get("ledger_key"),
+        "messages": messages,
+    }
+    info = dict(found)
+    info["conversation_id"] = found.get("id")
+    info["nav"] = found.get("last_nav")
+    return JSONResponse(body, headers=_muse_headers(info))
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(
     req: ChatRequest,
     _=Depends(auth),
     x_muse_role: str | None = Header(default=None),
     x_muse_project: str | None = Header(default=None),
+    x_muse_conversation: str | None = Header(default=None),
 ):
     """OpenAI 兼容的对话接口 —— 各类智能体客户端都能接。
 
@@ -1736,8 +2200,17 @@ async def chat_completions(
     旁聊：请求头 `X-Muse-Role` / `X-Muse-Project`，或 body 的
     `muse_role` / `muse_project`（也接受 `role` / `project`，以及
     `user=role:<slug>[:proj:<slug>]`）。都没有则每次新开 /thread/new。
+    可选 `X-Muse-Conversation` 作为恢复键。账号仍只由旁聊台账选择。
     """
-    prompt = build_chat_prompt(req.messages) or (req.prompt or "").strip()
+    model = resolve_model(req.model, default="muse-spark")
+    timeout = int(req.timeout or CFG.chat_timeout)
+    role, project = _chat_dimensions(req, x_muse_role, x_muse_project)
+    client_id = _clean_client_id(x_muse_conversation)
+    acc, sidechat = _route_chat_account(role, project)
+    delivery = compose_chat_prompt(req.messages, sidechat)
+    prompt = delivery["prompt"] or (req.prompt or "").strip()
+    full_prompt = delivery.get("full_prompt") or prompt
+    sidechat = delivery["sidechat"]
     if not prompt:
         raise HTTPException(400, "messages 为空")
 
@@ -1748,17 +2221,26 @@ async def chat_completions(
         # 放在末尾：开头是 agent 自己的 system 提示，夹在中间容易被忽略；
         # 紧贴用户消息之前，模型对末尾指令的遵守度明显更高。
         prompt = prompt + "\n\n" + tool_note
-
-    model = resolve_model(req.model, default="muse-spark")
-    timeout = int(req.timeout or CFG.chat_timeout)
-    role, project = _chat_dimensions(req, x_muse_role, x_muse_project)
-    acc, sidechat = _route_chat_account(role, project)
+        full_prompt = full_prompt + "\n\n" + tool_note
+    thread_args = _thread_prompt_args(delivery, full_prompt)
 
     cid = "chatcmpl-" + uuid.uuid4().hex[:24]
     created = int(time.time())
     acc_id = acc["id"]
     cookies = acc["cookies"]
     expires = acc.get("cookies_exp")
+    relay_messages = list(req.messages)
+    if not relay_messages and req.prompt:
+        relay_messages = [ChatMessage(role="user", content=req.prompt)]
+    pre = _relay_prepare(
+        client_id=client_id, client_supplied=bool(client_id), role=role, project=project,
+        sidechat=sidechat, model=model,
+    ) if req.stream else None
+    on_finished, box = _bind_relay_turn(
+        request_id=cid, model=model, role=role, project=project, sidechat=sidechat,
+        client_id=client_id, client_supplied=bool(client_id), messages=relay_messages,
+        prompt=prompt, conversation_id=(pre or {}).get("conversation_id"),
+    )
 
     def tool_call_deltas(calls: list[dict]) -> list[list[dict]]:
         """按 OpenAI 习惯分两片发：先 id/name，再 arguments 全文。"""
@@ -1777,12 +2259,13 @@ async def chat_completions(
 
                 stream_gen = safe_chat_stream(
                     cookies, prompt, expires, timeout, account_id=acc_id,
-                    chat_model=model, sidechat=sidechat)
+                    chat_model=model, sidechat=sidechat, on_finished=on_finished,
+                    **thread_args)
                 if not tool_note:
                     for chunk in stream_gen:
                         for piece in _pace_text(chunk):
                             yield _sse(_chat_chunk(cid, created, model, {"content": piece}))
-                    yield _sse(_chat_chunk(cid, created, model, {}, finish="stop"))
+                    yield _sse(_finish_chunk(cid, created, model, "stop", box.get("info")))
                 else:
                     buf, mode = "", None
                     for chunk in stream_gen:
@@ -1802,7 +2285,7 @@ async def chat_completions(
                                         yield _sse(_chat_chunk(cid, created, model, {"content": piece}))
                                     buf = ""
                     if mode == "text":
-                        yield _sse(_chat_chunk(cid, created, model, {}, finish="stop"))
+                        yield _sse(_finish_chunk(cid, created, model, "stop", box.get("info")))
                     else:
                         calls, rest = parse_tool_calls(buf)
                         if calls:
@@ -1811,12 +2294,12 @@ async def chat_completions(
                                     yield _sse(_chat_chunk(cid, created, model, {"content": piece}))
                             for piece in tool_call_deltas(calls):
                                 yield _sse(_chat_chunk(cid, created, model, {"tool_calls": piece}))
-                            yield _sse(_chat_chunk(cid, created, model, {}, finish="tool_calls"))
+                            yield _sse(_finish_chunk(cid, created, model, "tool_calls", box.get("info")))
                         else:
                             if buf:
                                 for piece in _pace_text(buf):
                                     yield _sse(_chat_chunk(cid, created, model, {"content": piece}))
-                            yield _sse(_chat_chunk(cid, created, model, {}, finish="stop"))
+                            yield _sse(_finish_chunk(cid, created, model, "stop", box.get("info")))
                 if _want_usage(req.stream_options):
                     yield _sse({"id": cid, "object": "chat.completion.chunk",
                                 "created": created, "model": model,
@@ -1836,36 +2319,40 @@ async def chat_completions(
                 yield _sse({"error": {"message": str(exc), "type": "server_error", "code": 502}})
             except Exception as exc:
                 yield _sse({"error": {"message": f"内部错误: {exc}", "type": "server_error", "code": 500}})
-        return StreamingResponse(sync_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
+        stream_headers = dict(_SSE_HEADERS)
+        stream_headers.update(_muse_headers(pre))
+        return StreamingResponse(sync_stream(), media_type="text/event-stream", headers=stream_headers)
 
     def run() -> str:
         return "".join(safe_chat_stream(
             cookies, prompt, expires, timeout, account_id=acc_id,
-            chat_model=model, sidechat=sidechat))
+            chat_model=model, sidechat=sidechat, on_finished=on_finished,
+            **thread_args))
 
     try:
         text = await asyncio.to_thread(run)
     except MuseAuthError as exc:
-        raise HTTPException(401, str(exc))
+        raise HTTPException(401, str(exc), headers=_muse_headers(box.get("info")))
     except MuseGenerationError as exc:
-        raise HTTPException(502, str(exc))
+        raise HTTPException(502, str(exc), headers=_muse_headers(box.get("info")))
 
     usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    info = box.get("info")
     if tool_note:
         calls, rest = parse_tool_calls(text)
         if calls:
-            return {"id": cid, "object": "chat.completion", "created": created,
-                    "model": model,
-                    "choices": [{"index": 0, "finish_reason": "tool_calls",
-                                 "message": {"role": "assistant",
-                                             "content": rest or None,
-                                             "tool_calls": calls}}],
-                    "usage": usage}
-    return {"id": cid, "object": "chat.completion", "created": created,
-            "model": model,
-            "choices": [{"index": 0, "finish_reason": "stop",
-                         "message": {"role": "assistant", "content": text}}],
-            "usage": usage}
+            return _chat_json({"id": cid, "object": "chat.completion", "created": created,
+                                "model": model,
+                                "choices": [{"index": 0, "finish_reason": "tool_calls",
+                                             "message": {"role": "assistant",
+                                                         "content": rest or None,
+                                                         "tool_calls": calls}}],
+                                "usage": usage}, info)
+    return _chat_json({"id": cid, "object": "chat.completion", "created": created,
+                       "model": model,
+                       "choices": [{"index": 0, "finish_reason": "stop",
+                                    "message": {"role": "assistant", "content": text}}],
+                       "usage": usage}, info)
 
 
 def _responses_messages(req: ResponsesRequest) -> list[ChatMessage]:
@@ -1909,29 +2396,44 @@ async def responses_api(
     _=Depends(auth),
     x_muse_role: str | None = Header(default=None),
     x_muse_project: str | None = Header(default=None),
+    x_muse_conversation: str | None = Header(default=None),
 ):
     """OpenAI Responses API —— 新版 Codex 默认走这个端点。
 
     只实现 Codex 实际用到的子集：文本进 → 文本出（含流式事件）。
     muse.ai 不会返回结构化的 tool_calls，关于工具调用的边界见 README。
+    可选 `X-Muse-Conversation` 作为恢复键。账号仍只由旁聊台账选择。
     """
-    prompt = build_chat_prompt(_responses_messages(req))
-    if not prompt:
-        raise HTTPException(400, "input 为空")
-
+    relay_messages = _responses_messages(req)
     model = resolve_model(req.model, default="muse-spark")
     timeout = int(req.timeout or CFG.chat_timeout)
     role, project = _chat_dimensions(req, x_muse_role, x_muse_project)
+    client_id = _clean_client_id(x_muse_conversation)
     acc, sidechat = _route_chat_account(role, project)
+    delivery = compose_chat_prompt(relay_messages, sidechat)
+    prompt = delivery["prompt"]
+    sidechat = delivery["sidechat"]
+    thread_args = _thread_prompt_args(delivery, delivery.get("full_prompt") or prompt)
+    if not prompt:
+        raise HTTPException(400, "input 为空")
 
     rid = "resp_" + uuid.uuid4().hex[:24]
     mid = "msg_" + uuid.uuid4().hex[:24]
     created = int(time.time())
     acc_id, cookies, expires = acc["id"], acc["cookies"], acc.get("cookies_exp")
+    pre = _relay_prepare(
+        client_id=client_id, client_supplied=bool(client_id), role=role, project=project,
+        sidechat=sidechat, model=model,
+    ) if req.stream else None
+    on_finished, box = _bind_relay_turn(
+        request_id=rid, model=model, role=role, project=project, sidechat=sidechat,
+        client_id=client_id, client_supplied=bool(client_id), messages=relay_messages,
+        prompt=prompt, conversation_id=(pre or {}).get("conversation_id"),
+    )
 
-    def envelope(status: str, text: str = "") -> dict:
+    def envelope(status: str, text: str = "", info: dict | None = None) -> dict:
         done = status == "completed"
-        return {"id": rid, "object": "response", "created_at": created,
+        body = {"id": rid, "object": "response", "created_at": created,
                 "status": status, "model": model,
                 "output": [{"type": "message", "id": mid, "role": "assistant",
                             "status": "completed" if done else "in_progress",
@@ -1939,6 +2441,10 @@ async def responses_api(
                                           "annotations": []}] if text else [])}],
                 "usage": {"input_tokens": 0, "output_tokens": 0,
                           "total_tokens": 0}}
+        muse = _muse_body(info)
+        if muse:
+            body["muse"] = muse
+        return body
 
     if req.stream:
         def sync_stream():
@@ -1958,7 +2464,8 @@ async def responses_api(
                 full = ""
                 for chunk in safe_chat_stream(
                         cookies, prompt, expires, timeout, account_id=acc_id,
-                        chat_model=model, sidechat=sidechat):
+                        chat_model=model, sidechat=sidechat, on_finished=on_finished,
+                        **thread_args):
                     full += chunk
                     yield _sse_event("response.output_text.delta", {
                         "type": "response.output_text.delta", "item_id": mid,
@@ -1974,27 +2481,49 @@ async def responses_api(
                                           "annotations": []}]}})
                 yield _sse_event("response.completed", {
                     "type": "response.completed",
-                    "response": envelope("completed", full)})
+                    "response": envelope("completed", full, box.get("info"))})
             except Exception as exc:  # noqa: BLE001
-                log.warning("responses 流式失败: %s", exc)
+                log.warning("responses stream failed err=%s", type(exc).__name__)
                 yield _sse_event("response.failed", {
                     "type": "response.failed",
-                    "response": envelope("failed")})
-        return StreamingResponse(sync_stream(), media_type="text/event-stream", headers=_SSE_HEADERS)
+                    "response": envelope("failed", info=box.get("info"))})
+        stream_headers = dict(_SSE_HEADERS)
+        stream_headers.update(_muse_headers(pre))
+        return StreamingResponse(sync_stream(), media_type="text/event-stream", headers=stream_headers)
 
     def run() -> str:
         return "".join(safe_chat_stream(
             cookies, prompt, expires, timeout, account_id=acc_id,
-            chat_model=model, sidechat=sidechat))
+            chat_model=model, sidechat=sidechat, on_finished=on_finished,
+            **thread_args))
 
     try:
         text = await asyncio.to_thread(run)
     except MuseAuthError as exc:
-        raise HTTPException(401, str(exc))
+        raise HTTPException(401, str(exc), headers=_muse_headers(box.get("info")))
     except MuseGenerationError as exc:
-        raise HTTPException(502, str(exc))
+        raise HTTPException(502, str(exc), headers=_muse_headers(box.get("info")))
 
-    return envelope("completed", text)
+    return JSONResponse(envelope("completed", text, box.get("info")),
+                        headers=_muse_headers(box.get("info")))
+
+
+@app.get("/v1/conversations/messages")
+def restore_conversation_header(
+    x_muse_conversation: str | None = Header(default=None),
+    _=Depends(auth),
+):
+    """按 X-Muse-Conversation 取回可灌回内存的历史。跳过选卡热身和 meta。"""
+    return _restore_payload(_restore_key(None, x_muse_conversation))
+
+
+@app.get("/v1/conversations/{client_id}/messages")
+def restore_conversation_path(
+    client_id: str,
+    x_muse_conversation: str | None = Header(default=None),
+    _=Depends(auth),
+):
+    return _restore_payload(_restore_key(client_id, x_muse_conversation))
 
 
 @app.get("/v1/media/{name}")
@@ -2028,6 +2557,103 @@ def admin_sidechat_stale(payload: dict = Body(default={}), _=Depends(auth)):
     if not ledger.mark_stale_key(key, reason=str((payload or {}).get("reason") or "manual")):
         raise HTTPException(404, "台账里没有这个 ledger_key")
     return {"ok": True, "ledger_key": key, "status": "stale", "deleted_remote": False}
+
+
+# ------------------------- 管理：对话正文 -------------------------
+def _relay_export(conversation_id: str | None = None):
+    filename = "relay.jsonl" if not conversation_id else f"{conversation_id}.jsonl"
+
+    def gen():
+        for line in relay.iter_jsonl(conversation_id):
+            yield line
+
+    return StreamingResponse(gen(), media_type="application/x-ndjson", headers={
+        "Content-Disposition": f'attachment; filename="{filename}"',
+        "Cache-Control": "no-store",
+        "X-Accel-Buffering": "no",
+    })
+
+
+@app.get("/admin/relay/conversations")
+def admin_relay_conversations(
+    limit: int = 50,
+    offset: int = 0,
+    status: str | None = None,
+    client_id: str | None = None,
+    role: str | None = None,
+    _=Depends(auth),
+):
+    """对话列表。只有元数据，没有 cookie，也没有消息正文。"""
+    rows = relay.list_conversations(
+        limit=limit, offset=offset, status=status, client_id=client_id, role=role,
+    )
+    public = []
+    for row in rows:
+        public.append({
+            "id": row.get("id"),
+            "client_id": row.get("client_id"),
+            "ledger_key": row.get("ledger_key"),
+            "role": row.get("role"),
+            "project": row.get("project"),
+            "account_id": row.get("account_id"),
+            "account_label": row.get("account_label"),
+            "session_id": row.get("session_id"),
+            "model": row.get("model"),
+            "created_at": row.get("created_at"),
+            "updated_at": row.get("updated_at"),
+            "last_nav": row.get("last_nav"),
+            "last_request_id": row.get("last_request_id"),
+            "status": row.get("status"),
+            "bytes": row.get("bytes"),
+        })
+    return {
+        "conversations": public,
+        "retention_days": relay.retention_days,
+        "max_bytes": relay.max_bytes,
+    }
+
+
+@app.get("/admin/relay/conversations/{conversation_id}")
+def admin_relay_messages(conversation_id: str, _=Depends(auth)):
+    found = relay.get_conversation(conversation_id)
+    if not found:
+        raise HTTPException(404, "对话不存在")
+    return {
+        "conversation": {
+            "id": found.get("id"),
+            "client_id": found.get("client_id"),
+            "ledger_key": found.get("ledger_key"),
+            "role": found.get("role"),
+            "project": found.get("project"),
+            "account_id": found.get("account_id"),
+            "account_label": found.get("account_label"),
+            "session_id": found.get("session_id"),
+            "model": found.get("model"),
+            "created_at": found.get("created_at"),
+            "updated_at": found.get("updated_at"),
+            "last_nav": found.get("last_nav"),
+            "status": found.get("status"),
+            "bytes": found.get("bytes"),
+        },
+        "messages": relay.messages_for(conversation_id, restore=False),
+    }
+
+
+@app.get("/admin/relay/conversations/{conversation_id}/export")
+def admin_relay_conversation_export(conversation_id: str, _=Depends(auth)):
+    if relay.get_conversation(conversation_id) is None:
+        raise HTTPException(404, "对话不存在")
+    return _relay_export(conversation_id)
+
+
+@app.get("/admin/relay/export")
+def admin_relay_export_all(_=Depends(auth)):
+    return _relay_export(None)
+
+
+@app.post("/admin/relay/cleanup")
+def admin_relay_cleanup(_=Depends(auth)):
+    return relay.cleanup()
 
 
 # ------------------------- 管理：总览 -------------------------
@@ -2671,6 +3297,17 @@ def _warmup_browser_sync():
         GEN_LOCK.release()
 
 
+async def _relay_cleanup_loop():
+    """每小时清一次对话正文。失败只记类型，不记正文。"""
+    while True:
+        await asyncio.sleep(3600)
+        try:
+            summary = await asyncio.to_thread(relay.cleanup)
+            log.info("relay cleanup deleted=%s", (summary or {}).get("deleted"))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("relay cleanup failed err=%s", type(exc).__name__)
+
+
 async def _keepalive_loop():
     """后台常驻守护任务：每 15 分钟轮询一次账号健康状态并保持 VM 热备，同时静默同步仓库更新。"""
     log.info("【自动保活守护进程】已启动，检测周期: 15 分钟")
@@ -2719,6 +3356,7 @@ def get_keepalive_status(_=Depends(auth)):
 REPO_URL = "https://github.com/czg86389-hub/muse2api"
 TRACKED_REPO_PATHS = [
     "app.py", "engine.py", "store.py", "cdp.py", "config.py", "proxy.py",
+    "sidechat.py", "redact.py", "relay.py",
     "admin.html", "README.md", "version.json", "requirements.txt",
     "Dockerfile", "docker-compose.yml", ".env.example", ".gitignore",
     "LICENSE", "extension", "deploy", "tools",
@@ -3088,6 +3726,12 @@ async def _startup():
         CFG.api_key = new_key
         _persist_env("MUSE2API_KEY", new_key)
         log.info("🔑 未检测到 MUSE2API_KEY，已自动生成初始密钥: %s", new_key)
+    try:
+        summary = await asyncio.to_thread(relay.cleanup)
+        log.info("relay cleanup deleted=%s", (summary or {}).get("deleted"))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("relay cleanup failed err=%s", type(exc).__name__)
+    asyncio.create_task(_relay_cleanup_loop())
     asyncio.create_task(_keepalive_loop())
 
 

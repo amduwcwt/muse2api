@@ -36,6 +36,18 @@ def _env(key: str, default: str) -> str:
     return os.environ.get(key, default)
 
 
+def max_prompt_chars() -> int:
+    """新线程全量提示词上限。非法或非正数退回 200000。"""
+    raw = _env("MUSE2API_MAX_PROMPT_CHARS", "200000").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 200000
+    if value <= 0:
+        return 200000
+    return value
+
+
 def _detect_chromium() -> str:
     """优先使用 MUSE2API_CHROMIUM；若未设置或路径不存在，则自动探测系统已安装的 Chromium/Chrome。"""
     configured = os.environ.get("MUSE2API_CHROMIUM", "").strip()
@@ -102,6 +114,8 @@ class Config:
     image_timeout: int = field(default_factory=lambda: int(_env("MUSE2API_IMAGE_TIMEOUT", "240")))
     video_timeout: int = field(default_factory=lambda: int(_env("MUSE2API_VIDEO_TIMEOUT", "600")))
     chat_timeout: int = field(default_factory=lambda: int(_env("MUSE2API_CHAT_TIMEOUT", "300")))
+    # 新旁聊 / 全量历史的提示词字符上限。续用命中时只发新增消息，不走这条截断。
+    max_prompt_chars: int = field(default_factory=lambda: max_prompt_chars())
     max_concurrency: int = field(default_factory=lambda: max(1, int(_env("MUSE2API_CONCURRENCY", "8"))))
 
     # 参考图输入默认只允许调用方直接提供数据和公网 URL。
@@ -118,6 +132,12 @@ class Config:
     # 若目标模型行为有变，可设 MUSE2API_TOOL_PROTOCOL=1 打开这层适配再试。
     tool_protocol: bool = field(
         default_factory=lambda: _env("MUSE2API_TOOL_PROTOCOL", "0").strip() != "0")
+
+    # 对话正文台账（data/relay.sqlite）。14 天或 400 MiB，先到先清。
+    relay_retention_days: int = field(
+        default_factory=lambda: int(_env("MUSE2API_RELAY_RETENTION_DAYS", "14")))
+    relay_max_bytes: int = field(
+        default_factory=lambda: int(_env("MUSE2API_RELAY_MAX_BYTES", str(400 * 1024 * 1024))))
 
     # 保活设置：是否对已禁用的账号执行自动保活，**默认关闭**。
     # 开启后，被管理员在后台手动禁用的账号仍会由后台守护进程执行自动保活与 VM 唤醒，
@@ -150,6 +170,11 @@ class Config:
     def sidechat_ledger_file(self) -> str:
         """运行时旁聊台账，与 accounts.json 同目录，随数据卷持久化。"""
         return os.path.join(self.data_dir, "sidechat_ledger.json")
+
+    @property
+    def relay_db_file(self) -> str:
+        """对话正文 SQLite。旁聊 JSON 不存消息正文。"""
+        return os.path.join(self.data_dir, "relay.sqlite")
 
     @property
     def tasks_file(self) -> str:

@@ -3,6 +3,12 @@
 运行时文件与 accounts.json 同目录：data/sidechat_ledger.json。
 仓库只提交 data/sidechat_ledger.example.json，不写真实 sessionId、cookie 或 API key。
 
+这份 JSON 只做 session 路由（session_id、账号、use_count、status）。
+对话正文在 data/relay.sqlite，不要把消息写进这里。
+
+已提交过的消息不写正文，只记可选游标：sent_count、sent_fp、sent_system_fp。
+旧条目没有这些字段时照常加载，由调用方按全量处理一次再补上。
+
 没有 role/project 的请求不进台账，由调用方走策略 A（每次新开 /thread/new，
 不再按气泡 <24 复用上一条旁聊）。
 """
@@ -14,6 +20,7 @@ import threading
 import time
 import uuid
 
+from redact import scrub as _scrub
 from store import _read, _write
 
 LEDGER_VERSION = 1
@@ -28,11 +35,6 @@ _USER_KEY = re.compile(
 )
 _SESSION_ID = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 _RESERVED_THREAD = {"new", "main"}
-_SECRET_KEYS = {
-    "cookies", "cookie", "cookie_header", "authorization", "api_key",
-    "password", "proxy",
-}
-
 _LOCKS: dict[str, threading.Lock] = {}
 _LOCKS_GUARD = threading.Lock()
 
@@ -92,6 +94,37 @@ def session_id_from_path(path: str | None) -> str | None:
     if sid.lower() in _RESERVED_THREAD or not _SESSION_ID.fullmatch(sid):
         return None
     return sid
+
+
+def _clean_sent_count(value):
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    if number < 0:
+        return None
+    return number
+
+
+def _clean_sent_fp(value):
+    if not isinstance(value, str):
+        return None
+    text = value.strip().lower()
+    if re.fullmatch(r"[0-9a-f]{16}", text):
+        return text
+    return None
+
+
+def cursor_view(entry: dict | None) -> dict:
+    """台账上的已发送游标。缺字段或格式不对都当成没有。"""
+    entry = entry or {}
+    return {
+        "sent_count": _clean_sent_count(entry.get("sent_count")),
+        "sent_fp": _clean_sent_fp(entry.get("sent_fp")),
+        "sent_system_fp": _clean_sent_fp(entry.get("sent_system_fp")),
+    }
 
 
 def thread_url(session_id: str | None) -> str:
@@ -176,19 +209,6 @@ def _empty_doc() -> dict:
         "entries": [],
         "role_account_map": {},
     }
-
-
-def _scrub(value):
-    """台账落盘前丢掉任何看起来像凭据的字段。"""
-    if isinstance(value, dict):
-        return {
-            str(k): _scrub(v)
-            for k, v in value.items()
-            if str(k).lower() not in _SECRET_KEYS
-        }
-    if isinstance(value, list):
-        return [_scrub(v) for v in value]
-    return value
 
 
 class SidechatLedger:
@@ -289,6 +309,10 @@ class SidechatLedger:
                 "传入了 project 但没有 role；请同时提供 X-Muse-Role 或 muse_role"
             )
         key = ledger_key(role, project)
+        with self._lock:
+            self._reload_if_disk_changed()
+            entry = self._find(key)
+            mapped = self._mapped_account(role)
         base = {
             "strategy": "bc",
             "ledger_key": key,
@@ -298,10 +322,7 @@ class SidechatLedger:
             "failover": False,
             "retire_session_id": None,
         }
-        with self._lock:
-            self._reload_if_disk_changed()
-            entry = self._find(key)
-            mapped = self._mapped_account(role)
+        base.update(cursor_view(entry))
         entry_id = (entry or {}).get("muse_account_id")
         entry_status = (entry or {}).get("status")
         entry_session = (entry or {}).get("session_id") if entry_status == "active" else None
@@ -369,7 +390,10 @@ class SidechatLedger:
                       session_id: str | None = None, bubble_hint: int | None = None,
                       renamed: bool = False, nav: str | None = None,
                       retire_session_id: str | None = None,
-                      failover: bool = False) -> dict | None:
+                      failover: bool = False,
+                      sent_count: int | None = None,
+                      sent_fp: str | None = None,
+                      sent_system_fp: str | None = None) -> dict | None:
         """首条发出后回填 sessionId。没有新 id 且旧线程已作废时改为 pending，避免再续用。"""
         if not ledger_key or not account_id:
             return None
@@ -426,6 +450,15 @@ class SidechatLedger:
                     pass
             entry["renamed"] = bool(renamed)
             entry["last_nav"] = nav
+            # 不传则保留旧游标，旧条目不会被一次无关回填清掉。
+            count = _clean_sent_count(sent_count)
+            fp = _clean_sent_fp(sent_fp)
+            system_fp = _clean_sent_fp(sent_system_fp)
+            if count is not None and fp is not None:
+                entry["sent_count"] = count
+                entry["sent_fp"] = fp
+                if system_fp is not None:
+                    entry["sent_system_fp"] = system_fp
             self._save()
             return dict(entry)
 

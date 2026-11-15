@@ -34,6 +34,7 @@ import uuid
 import unicodedata
 
 from cdp import CDP, http_json
+from chat_extract import INSTALL_JS, poll_expression
 from proxy import HTTPProxyRelay, request_proxy_context
 from sidechat import BUBBLE_ROLLOVER, session_id_from_path, thread_url
 
@@ -517,6 +518,11 @@ class MuseEngine:
             page.send("Network.enable")
             page.send("Page.enable")
             page.send("Runtime.enable")
+            try:
+                # 下次导航起，在页面自己的 JSON.parse 上抓解密后的助手原文。
+                page.send("Page.addScriptToEvaluateOnNewDocument", {"source": INSTALL_JS})
+            except Exception:
+                log.info("chat extract preload failed")
             page.send("Browser.setDownloadBehavior", {
                 "behavior": "allow", "downloadPath": self._new_download_dir(),
                 "browserContextId": ctx_id,
@@ -1658,15 +1664,57 @@ class MuseEngine:
         except Exception:  # noqa: BLE001
             return 0
 
-    def _poll_chat(self) -> tuple[int, str, bool]:
+    def _install_chat_capture(self) -> None:
+        """在当前文档挂上原文捕获。失败时轮询会退回 DOM / innerText。"""
+        if not self.page:
+            return
         try:
-            raw = self.page.js(self._POLL_CHAT_JS)
+            self.page.js(INSTALL_JS)
+        except Exception:
+            log.info("chat extract install failed")
+
+    def _mark_chat_turn(self) -> None:
+        if not self.page:
+            return
+        try:
+            self.page.js("window.__m2aExtract&&window.__m2aExtract.markTurn()")
+        except Exception:
+            log.info("chat extract mark failed")
+
+    def _lock_extract(self, state: dict, sent: str, method: str, cur: str) -> str | None:
+        """同一轮里不把更低保真度的文本拼进已经采用的原文。"""
+        rank = {"network": 2, "dom": 1, "innerText": 0}
+        if method not in rank:
+            method = "innerText"
+        prev = state.get("method")
+        if prev and method != prev:
+            if rank[method] > rank[prev] and (not sent or cur.startswith(sent)):
+                log.info("chat extract method=%s chars=%s", method, len(cur))
+                state["method"] = method
+                return cur
+            return None
+        if prev != method:
+            log.info("chat extract method=%s chars=%s", method, len(cur))
+            state["method"] = method
+        return cur
+
+    def _poll_chat(self, baseline: int | None = None) -> tuple[int, str, bool, str]:
+        try:
+            raw = self.page.js(poll_expression(baseline))
             if raw:
                 d = json.loads(raw)
-                return int(d.get("cnt") or 0), (d.get("txt") or "").strip(), bool(d.get("stop"))
+                method = str(d.get("extract") or "innerText")
+                if method not in ("network", "dom", "innerText"):
+                    method = "innerText"
+                txt = d.get("txt") or ""
+                if not isinstance(txt, str):
+                    txt = str(txt)
+                if method == "innerText":
+                    txt = txt.strip()
+                return int(d.get("cnt") or 0), txt, bool(d.get("stop")), method
         except Exception:
             pass
-        return 0, "", False
+        return 0, "", False, "innerText"
 
     # ---------------- 网页选卡 Wonder / Ember / 智能路由 ----------------
     # muse.ai 消费端走 Hatch Noise RPC：model.get / model.set（path /model，
@@ -1763,7 +1811,7 @@ class MuseEngine:
             if stop_event is not None and stop_event.is_set():
                 return
             time.sleep(0.12)
-            _cnt, cur, has_stop = self._poll_chat()
+            _cnt, cur, has_stop, _method = self._poll_chat()
             if not cur:
                 continue
             if cur != last:
@@ -1780,6 +1828,7 @@ class MuseEngine:
     def _ensure_chat_model(self, chat_model: str | None, stop_event=None,
                            wait_s: float = 6.0) -> str:
         """发送前确保网页选卡与请求一致。返回实际卡：auto/wonder/ember。"""
+        self.chat_warmup_sent = False
         card = self._normalize_chat_card(chat_model)
         deadline = time.time() + wait_s
         last: dict = {}
@@ -1800,6 +1849,7 @@ class MuseEngine:
         log.info("选卡 %s 未就绪，热身后重试: %s", card, last)
         try:
             self._send(".")
+            self.chat_warmup_sent = True
             self._wait_generation_idle(timeout=90.0, stop_event=stop_event)
         except Exception as exc:  # noqa: BLE001
             raise MuseGenerationError(f"选卡热身失败（{card}）: {exc}") from exc
@@ -1816,11 +1866,34 @@ class MuseEngine:
             f"无法切换到网页选卡 {card}（model.get/set UI 未出现或点击失败）: {last}"
         )
 
+    @staticmethod
+    def prompt_for_nav(prompt: str, full_prompt: str | None, nav: str, *,
+                       omitted: int = 0, before_chars: int = 0, limit: int = 0) -> str:
+        """续用才发增量。新开线程（切号、打不开旧 session、nav=new/fresh/stale/rollover）改发全量。
+
+        日志只有 nav 和字符数，不写正文。
+        """
+        if not full_prompt or nav in ("resumed", "reused"):
+            return prompt
+        if prompt != full_prompt:
+            log.info(
+                "sidechat prompt failover new-thread full prompt_chars=%s nav=%s",
+                len(full_prompt), nav,
+            )
+            if omitted or (before_chars and limit and before_chars > limit):
+                log.warning(
+                    "chat prompt truncated prompt_chars=%s before_chars=%s omitted=%s limit=%s",
+                    len(full_prompt), before_chars, omitted, limit,
+                )
+        return full_prompt
+
     def chat_stream(self, cookies: dict, prompt: str, expires: dict | None = None,
                     timeout: int | None = None, account_id: str | None = None,
                     stop_event=None, chat_model: str | None = None,
                     session_id: str | None = None, sidechat_label: str | None = None,
-                    sidechat_state: dict | None = None):
+                    sidechat_state: dict | None = None,
+                    full_prompt: str | None = None, full_omitted: int = 0,
+                    full_before_chars: int = 0, prompt_limit: int = 0):
         """发一条消息，流式 yield 增量文本。
 
         session_id 有值时续用该旁聊；没有则策略 A，新开 /thread/new。
@@ -1829,13 +1902,21 @@ class MuseEngine:
         timeout = int(timeout or getattr(self.cfg, "chat_timeout", 300))
         nav = "skipped"
         resumed_id = None
+        self.chat_warmup_sent = False
         try:
             self.ensure_page(cookies, expires, account_id=account_id)
             nav = self.reset_thread(for_chat=True, session_id=session_id)
             if nav in ("resumed", "reused"):
                 resumed_id = session_id
+            # 换页会清掉页面脚本，选卡热身之前装上，热身回复不计入本轮。
+            self._install_chat_capture()
             self._ensure_chat_model(chat_model, stop_event=stop_event)
-            base_agent, base_text, _ = self._poll_chat()
+            self._mark_chat_turn()
+            base_agent, base_text, _, _ = self._poll_chat(None)
+            prompt = self.prompt_for_nav(
+                prompt, full_prompt, nav,
+                omitted=full_omitted, before_chars=full_before_chars, limit=prompt_limit,
+            )
             self._send(prompt)
 
             t_sent = time.time()
@@ -1843,14 +1924,15 @@ class MuseEngine:
             first_token_deadline = min(deadline, t_sent + 40.0)
             sent, last, stable = "", None, 0
             got_first = False
+            extract_state: dict = {"method": None}
 
             # 1. 等待助手生成并开始吐字（高频 60ms 采样，捕获到首批增量文字瞬间 yield 出去）
             while time.time() < first_token_deadline:
                 if stop_event is not None and stop_event.is_set():
                     return
                 time.sleep(0.06)
-                cnt, cur, has_stop = self._poll_chat()
-                if not cur or (cnt <= base_agent and cur == base_text):
+                cnt, cur, has_stop, method = self._poll_chat(base_agent)
+                if not cur or (method == "innerText" and cnt <= base_agent and cur == base_text):
                     if time.time() - t_sent > 14.0:
                         try:
                             tail = self.page.js("document.body.innerText.slice(-500)") or ""
@@ -1859,7 +1941,13 @@ class MuseEngine:
                         if "Still sending" in tail or "Connecting..." in tail:
                             raise MuseGenerationError("云端 VM 连接超时 (Still sending)")
                     continue
+                # DOM 往往先画出来。给解密后的 JSON 留一个很短的窗口，避免锁死在 innerText。
+                if method != "network" and time.time() - t_sent < 0.45:
+                    continue
 
+                cur = self._lock_extract(extract_state, sent, method, cur)
+                if cur is None:
+                    continue
                 delta = cur[len(sent):] if cur.startswith(sent) else cur
                 if delta:
                     sent = cur
@@ -1876,8 +1964,12 @@ class MuseEngine:
                 if stop_event is not None and stop_event.is_set():
                     return
                 time.sleep(0.06)
-                cnt, cur, has_stop = self._poll_chat()
-                if not cur:
+                cnt, cur, has_stop, method = self._poll_chat(base_agent)
+                if not cur or (method == "innerText" and cnt <= base_agent and cur == base_text
+                               and extract_state.get("method") != "innerText"):
+                    continue
+                cur = self._lock_extract(extract_state, sent, method, cur)
+                if cur is None:
                     continue
 
                 if cur != last:
