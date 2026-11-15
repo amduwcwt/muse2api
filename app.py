@@ -511,7 +511,9 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                      timeout: int, account_id: str | None,
                      chat_model: str | None = None,
                      sidechat: dict | None = None,
-                     on_finished=None, capture: dict | None = None):
+                     on_finished=None, capture: dict | None = None,
+                     full_prompt: str | None = None, full_omitted: int = 0,
+                     full_before_chars: int = 0, prompt_limit: int = 0):
     """在独立线程中执行 chat_stream 并持有 GEN_LOCK，通过 Queue 往外吐。
     无论下游客户端何时断连、异常或超时，stop_event + finally 块保证 100% 立即释放 GEN_LOCK，绝不死锁。
     若首字前遇到单账号 VM 卡死或会话异常，自动切换下一个健康账号重试一次。
@@ -613,6 +615,9 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                                 session_id=(plan or {}).get("session_id"),
                                 sidechat_label=(plan or {}).get("label"),
                                 sidechat_state=state,
+                                full_prompt=full_prompt, full_omitted=full_omitted,
+                                full_before_chars=full_before_chars,
+                                prompt_limit=prompt_limit,
                             ):
                                 yielded = True
                                 reply_parts.append(chunk)
@@ -1107,6 +1112,24 @@ def _fit_chat_messages(messages: list[ChatMessage], limit: int) -> tuple[list[Ch
     return pack(best)
 
 
+def _render_limited_prompt(messages: list[ChatMessage], limit: int) -> tuple[str, int, int]:
+    """返回 (提示词, 省略条数, 截断前字符数)。未超限时省略条数为 0。"""
+    before = build_chat_prompt(messages)
+    before_chars = len(before)
+    if before_chars <= limit:
+        return before, 0, before_chars
+    fitted, omitted = _fit_chat_messages(messages, limit)
+    return build_chat_prompt(fitted), omitted, before_chars
+
+
+def _log_prompt_truncation(prompt: str, before_chars: int, omitted: int, limit: int) -> None:
+    if omitted or before_chars > limit:
+        log.warning(
+            "chat prompt truncated prompt_chars=%s before_chars=%s omitted=%s limit=%s",
+            len(prompt), before_chars, omitted, limit,
+        )
+
+
 def compose_chat_prompt(messages, sidechat: dict | None = None, *,
                         limit: int | None = None) -> dict:
     """决定这一轮发给 Muse 的提示词。
@@ -1124,10 +1147,14 @@ def compose_chat_prompt(messages, sidechat: dict | None = None, *,
         # 没有 messages 时不要因为对不上指纹就把还在用的旁聊清掉。
         return {
             "prompt": "",
+            "full_prompt": "",
             "sidechat": sidechat,
             "mode": "full",
             "reason": "empty",
             "omitted": 0,
+            "full_omitted": 0,
+            "full_before_chars": 0,
+            "limit": limit,
         }
     system, turns = _split_chat_messages(normalized)
     plan = dict(sidechat) if sidechat else None
@@ -1167,17 +1194,15 @@ def compose_chat_prompt(messages, sidechat: dict | None = None, *,
             plan["session_id"] = None
             to_send = normalized
 
-    before = build_chat_prompt(to_send)
-    omitted = 0
-    if len(before) > limit:
-        fitted, omitted = _fit_chat_messages(to_send, limit)
-        prompt = build_chat_prompt(fitted)
-        log.warning(
-            "chat prompt truncated prompt_chars=%s before_chars=%s omitted=%s limit=%s",
-            len(prompt), len(before), omitted, limit,
-        )
+    # full_prompt 留给「组完增量之后又新开了线程」：切号、nav=new/fresh/stale/rollover。
+    # 续用命中时不把它发出去，所以这里不为它单独告警。
+    full_prompt, full_omitted, full_before = _render_limited_prompt(normalized, limit)
+    if mode == "incremental":
+        prompt, omitted, before_chars = _render_limited_prompt(to_send, limit)
+        _log_prompt_truncation(prompt, before_chars, omitted, limit)
     else:
-        prompt = before
+        prompt, omitted = full_prompt, full_omitted
+        _log_prompt_truncation(prompt, full_before, full_omitted, limit)
     if plan is not None and reason == "legacy":
         log.info(
             "sidechat prompt full key=%s reason=legacy prompt_chars=%s",
@@ -1191,10 +1216,24 @@ def compose_chat_prompt(messages, sidechat: dict | None = None, *,
         }
     return {
         "prompt": prompt,
+        "full_prompt": full_prompt,
         "sidechat": plan,
         "mode": mode,
         "reason": reason,
         "omitted": omitted,
+        "full_omitted": full_omitted,
+        "full_before_chars": full_before,
+        "limit": limit,
+    }
+
+
+def _thread_prompt_args(delivery: dict, full_prompt: str) -> dict:
+    """交给 chat_stream：新开线程时用截断后的全量，而不是已经组好的增量。"""
+    return {
+        "full_prompt": full_prompt,
+        "full_omitted": int(delivery.get("full_omitted") or 0),
+        "full_before_chars": int(delivery.get("full_before_chars") or 0),
+        "prompt_limit": int(delivery.get("limit") or 0),
     }
 
 
@@ -2170,6 +2209,7 @@ async def chat_completions(
     acc, sidechat = _route_chat_account(role, project)
     delivery = compose_chat_prompt(req.messages, sidechat)
     prompt = delivery["prompt"] or (req.prompt or "").strip()
+    full_prompt = delivery.get("full_prompt") or prompt
     sidechat = delivery["sidechat"]
     if not prompt:
         raise HTTPException(400, "messages 为空")
@@ -2181,6 +2221,8 @@ async def chat_completions(
         # 放在末尾：开头是 agent 自己的 system 提示，夹在中间容易被忽略；
         # 紧贴用户消息之前，模型对末尾指令的遵守度明显更高。
         prompt = prompt + "\n\n" + tool_note
+        full_prompt = full_prompt + "\n\n" + tool_note
+    thread_args = _thread_prompt_args(delivery, full_prompt)
 
     cid = "chatcmpl-" + uuid.uuid4().hex[:24]
     created = int(time.time())
@@ -2217,7 +2259,8 @@ async def chat_completions(
 
                 stream_gen = safe_chat_stream(
                     cookies, prompt, expires, timeout, account_id=acc_id,
-                    chat_model=model, sidechat=sidechat, on_finished=on_finished)
+                    chat_model=model, sidechat=sidechat, on_finished=on_finished,
+                    **thread_args)
                 if not tool_note:
                     for chunk in stream_gen:
                         for piece in _pace_text(chunk):
@@ -2283,7 +2326,8 @@ async def chat_completions(
     def run() -> str:
         return "".join(safe_chat_stream(
             cookies, prompt, expires, timeout, account_id=acc_id,
-            chat_model=model, sidechat=sidechat, on_finished=on_finished))
+            chat_model=model, sidechat=sidechat, on_finished=on_finished,
+            **thread_args))
 
     try:
         text = await asyncio.to_thread(run)
@@ -2369,6 +2413,7 @@ async def responses_api(
     delivery = compose_chat_prompt(relay_messages, sidechat)
     prompt = delivery["prompt"]
     sidechat = delivery["sidechat"]
+    thread_args = _thread_prompt_args(delivery, delivery.get("full_prompt") or prompt)
     if not prompt:
         raise HTTPException(400, "input 为空")
 
@@ -2419,7 +2464,8 @@ async def responses_api(
                 full = ""
                 for chunk in safe_chat_stream(
                         cookies, prompt, expires, timeout, account_id=acc_id,
-                        chat_model=model, sidechat=sidechat, on_finished=on_finished):
+                        chat_model=model, sidechat=sidechat, on_finished=on_finished,
+                        **thread_args):
                     full += chunk
                     yield _sse_event("response.output_text.delta", {
                         "type": "response.output_text.delta", "item_id": mid,
@@ -2448,7 +2494,8 @@ async def responses_api(
     def run() -> str:
         return "".join(safe_chat_stream(
             cookies, prompt, expires, timeout, account_id=acc_id,
-            chat_model=model, sidechat=sidechat, on_finished=on_finished))
+            chat_model=model, sidechat=sidechat, on_finished=on_finished,
+            **thread_args))
 
     try:
         text = await asyncio.to_thread(run)

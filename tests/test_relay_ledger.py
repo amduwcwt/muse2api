@@ -340,7 +340,7 @@ def test_routes_require_auth_and_chat_hook():
         )
 
     def fake_stream(cookies, prompt, expires, timeout, account_id=None, chat_model=None,
-                    sidechat=None, on_finished=None, capture=None):
+                    sidechat=None, on_finished=None, capture=None, **_extra):
         reply = "muse-reply-two" if "second-question" in (prompt or "") else "muse-reply-ok"
         snap = {
             "account_id": "acc-actual",

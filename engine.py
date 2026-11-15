@@ -1866,11 +1866,34 @@ class MuseEngine:
             f"无法切换到网页选卡 {card}（model.get/set UI 未出现或点击失败）: {last}"
         )
 
+    @staticmethod
+    def prompt_for_nav(prompt: str, full_prompt: str | None, nav: str, *,
+                       omitted: int = 0, before_chars: int = 0, limit: int = 0) -> str:
+        """续用才发增量。新开线程（切号、打不开旧 session、nav=new/fresh/stale/rollover）改发全量。
+
+        日志只有 nav 和字符数，不写正文。
+        """
+        if not full_prompt or nav in ("resumed", "reused"):
+            return prompt
+        if prompt != full_prompt:
+            log.info(
+                "sidechat prompt failover new-thread full prompt_chars=%s nav=%s",
+                len(full_prompt), nav,
+            )
+            if omitted or (before_chars and limit and before_chars > limit):
+                log.warning(
+                    "chat prompt truncated prompt_chars=%s before_chars=%s omitted=%s limit=%s",
+                    len(full_prompt), before_chars, omitted, limit,
+                )
+        return full_prompt
+
     def chat_stream(self, cookies: dict, prompt: str, expires: dict | None = None,
                     timeout: int | None = None, account_id: str | None = None,
                     stop_event=None, chat_model: str | None = None,
                     session_id: str | None = None, sidechat_label: str | None = None,
-                    sidechat_state: dict | None = None):
+                    sidechat_state: dict | None = None,
+                    full_prompt: str | None = None, full_omitted: int = 0,
+                    full_before_chars: int = 0, prompt_limit: int = 0):
         """发一条消息，流式 yield 增量文本。
 
         session_id 有值时续用该旁聊；没有则策略 A，新开 /thread/new。
@@ -1890,6 +1913,10 @@ class MuseEngine:
             self._ensure_chat_model(chat_model, stop_event=stop_event)
             self._mark_chat_turn()
             base_agent, base_text, _, _ = self._poll_chat(None)
+            prompt = self.prompt_for_nav(
+                prompt, full_prompt, nav,
+                omitted=full_omitted, before_chars=full_before_chars, limit=prompt_limit,
+            )
             self._send(prompt)
 
             t_sent = time.time()

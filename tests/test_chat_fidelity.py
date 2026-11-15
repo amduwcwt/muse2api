@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import app  # noqa: E402
+import engine as engine_mod  # noqa: E402
 from chat_extract import INSTALL_JS, poll_expression  # noqa: E402
 from config import max_prompt_chars  # noqa: E402
 from sidechat import SidechatLedger  # noqa: E402
@@ -401,7 +402,184 @@ def test_prompt_cursor_and_truncation():
     print("PASS: incremental prompt, mismatch, truncation, legacy cursor")
 
 
+def _history_parts():
+    system = app.ChatMessage(role="system", content="SYS_KEEP")
+    first = app.ChatMessage(role="user", content="FIRST_KEEP")
+    drop_one = app.ChatMessage(role="user", content="DROP_ONE_" + ("x" * 3000))
+    drop_two = app.ChatMessage(role="assistant", content="DROP_TWO_" + ("y" * 3000))
+    recent = app.ChatMessage(role="user", content="RECENT_KEEP")
+    return system, first, drop_one, drop_two, recent
+
+
+def _fit_limit(kept: list) -> int:
+    return len(app.build_chat_prompt(kept))
+
+
+def test_failover_new_thread_uses_full_history():
+    logger, handler, records = _listen()
+    path = tempfile.mktemp(suffix=".json")
+    try:
+        system, first, drop_one, drop_two, recent = _history_parts()
+        history = [system, first, drop_one, drop_two, recent]
+        newest = app.ChatMessage(role="user", content="ONLY_NEW_TURN")
+        marker = app.ChatMessage(role="user", content="[省略 2 条早期消息]")
+        limit = _fit_limit([system, first, marker, recent, newest])
+        ledger = SidechatLedger(path)
+        ledger.record_result(
+            ledger_key="role:ops", role="ops", project=None,
+            account_id="acc-ops", session_id="example-session-not-real", nav="fresh",
+        )
+        seeded = app.compose_chat_prompt(history, {
+            "strategy": "bc", "ledger_key": "role:ops", "role": "ops",
+            "session_id": "example-session-not-real", "sent_fp": None,
+        }, limit=limit)
+        assert seeded["reason"] == "legacy"
+        ledger.record_result(
+            ledger_key="role:ops", role="ops", project=None,
+            account_id="acc-ops", session_id="example-session-not-real", nav="resumed",
+            sent_count=seeded["sidechat"]["prompt_cursor"]["sent_count"],
+            sent_fp=seeded["sidechat"]["prompt_cursor"]["sent_fp"],
+            sent_system_fp=seeded["sidechat"]["prompt_cursor"]["sent_system_fp"],
+        )
+        plan = ledger.plan("ops", None, _accounts())
+        records.clear()
+        delivery = app.compose_chat_prompt(history + [newest], plan, limit=limit)
+        assert delivery["mode"] == "incremental"
+        assert delivery["prompt"] == "ONLY_NEW_TURN"
+        assert "DROP_ONE_" not in delivery["prompt"]
+        assert delivery["full_prompt"] != delivery["prompt"]
+        assert "[省略 2 条早期消息]" in delivery["full_prompt"]
+        assert "FIRST_KEEP" in delivery["full_prompt"]
+        assert "RECENT_KEEP" in delivery["full_prompt"]
+        assert "ONLY_NEW_TURN" in delivery["full_prompt"]
+        assert "SYS_KEEP" in delivery["full_prompt"]
+        assert "DROP_ONE_" not in delivery["full_prompt"]
+        assert "DROP_TWO_" not in delivery["full_prompt"]
+        assert delivery["sidechat"]["session_id"] == "example-session-not-real"
+
+        choose = engine_mod.MuseEngine.prompt_for_nav
+        assert choose(delivery["prompt"], delivery["full_prompt"], "resumed") == "ONLY_NEW_TURN"
+        assert choose(delivery["prompt"], delivery["full_prompt"], "reused") == "ONLY_NEW_TURN"
+        records.clear()
+        for nav in ("new", "fresh", "stale", "rollover"):
+            sent = choose(
+                delivery["prompt"], delivery["full_prompt"], nav,
+                omitted=delivery["full_omitted"],
+                before_chars=delivery["full_before_chars"],
+                limit=delivery["limit"],
+            )
+            assert sent == delivery["full_prompt"], nav
+            assert sent != "ONLY_NEW_TURN"
+        logged = "\n".join(records)
+        assert "sidechat prompt failover new-thread full" in logged
+        assert "prompt_chars=" in logged
+        assert "nav=new" in logged
+        assert "chat prompt truncated" in logged
+        assert "omitted=" in logged
+        assert "before_chars=" in logged
+        assert "DROP_ONE_" not in logged
+        assert "ONLY_NEW_TURN" not in logged
+        assert "FIRST_KEEP" not in logged
+        assert "sekret" not in logged
+    finally:
+        logger.removeHandler(handler)
+        if os.path.exists(path):
+            os.remove(path)
+    print("PASS: failover new thread sends truncated full history")
+
+
+def test_mismatch_and_legacy_full_truncation():
+    logger, handler, records = _listen()
+    path = tempfile.mktemp(suffix=".json")
+    try:
+        system, first, drop_one, drop_two, recent = _history_parts()
+        history = [system, first, drop_one, drop_two, recent]
+        marker = app.ChatMessage(role="user", content="[省略 2 条早期消息]")
+        limit = _fit_limit([system, first, marker, recent])
+        ledger = SidechatLedger(path)
+        Path(path).write_text(json.dumps({
+            "version": 1,
+            "entries": [{
+                "ledger_key": "role:ops", "role": "ops", "status": "active",
+                "muse_account_id": "acc-ops", "session_id": "example-session-not-real",
+                "use_count": 1,
+            }],
+            "role_account_map": {"ops": "acc-ops"},
+        }), encoding="utf-8")
+        ledger = SidechatLedger(path)
+        plan = ledger.plan("ops", None, _accounts())
+        assert plan["sent_fp"] is None
+        assert plan["session_id"] == "example-session-not-real"
+        records.clear()
+        legacy = app.compose_chat_prompt(history, plan, limit=limit)
+        assert legacy["reason"] == "legacy"
+        assert legacy["mode"] == "full"
+        assert legacy["sidechat"]["session_id"] == "example-session-not-real"
+        assert legacy["prompt"] == legacy["full_prompt"]
+        assert "[省略 2 条早期消息]" in legacy["prompt"]
+        assert "SYS_KEEP" in legacy["prompt"] and "FIRST_KEEP" in legacy["prompt"]
+        assert "RECENT_KEEP" in legacy["prompt"]
+        assert "DROP_ONE_" not in legacy["prompt"] and "DROP_TWO_" not in legacy["prompt"]
+        logged = "\n".join(records)
+        assert "chat prompt truncated" in logged
+        assert "prompt_chars=" in logged and "before_chars=" in logged
+        assert "omitted=2" in logged and f"limit={limit}" in logged
+        assert "reason=legacy" in logged
+        assert "DROP_ONE_" not in logged and "FIRST_KEEP" not in logged
+        assert ledger.plan("ops", None, _accounts())["sent_fp"] is None
+
+        old_ledger = app.ledger
+        app.ledger = ledger
+        try:
+            app._commit_sidechat(
+                legacy["sidechat"],
+                {"nav": "resumed", "session_id": "example-session-not-real"},
+                "acc-ops", accept_cursor=False,
+            )
+            assert ledger.plan("ops", None, _accounts())["sent_fp"] is None
+            app._commit_sidechat(
+                legacy["sidechat"],
+                {"nav": "resumed", "session_id": "example-session-not-real"},
+                "acc-ops", accept_cursor=True,
+            )
+            assert ledger.plan("ops", None, _accounts())["sent_fp"] == legacy["sidechat"]["prompt_cursor"]["sent_fp"]
+        finally:
+            app.ledger = old_ledger
+
+        records.clear()
+        mismatched = app.compose_chat_prompt(
+            [app.ChatMessage(role="system", content="SYS_KEEP"),
+             app.ChatMessage(role="user", content="REWRITTEN_FIRST")] + history[2:],
+            ledger.plan("ops", None, _accounts()),
+            limit=limit,
+        )
+        assert mismatched["reason"] == "mismatch"
+        assert mismatched["mode"] == "full_new"
+        assert mismatched["sidechat"]["session_id"] is None
+        assert mismatched["prompt"] == mismatched["full_prompt"]
+        assert "REWRITTEN_FIRST" in mismatched["prompt"]
+        assert "[省略 2 条早期消息]" in mismatched["prompt"]
+        assert "DROP_ONE_" not in mismatched["prompt"]
+        mismatch_log = "\n".join(records)
+        assert "prefix mismatch" in mismatch_log
+        assert "action=new_thread" in mismatch_log
+        assert "chat prompt truncated" in mismatch_log
+        assert "prompt_chars=" in mismatch_log
+        assert "REWRITTEN_FIRST" not in mismatch_log
+        assert "DROP_ONE_" not in mismatch_log
+        assert max_prompt_chars() == 200000 or os.environ.get("MUSE2API_MAX_PROMPT_CHARS")
+        os.environ.pop("MUSE2API_MAX_PROMPT_CHARS", None)
+        assert max_prompt_chars() == 200000
+    finally:
+        logger.removeHandler(handler)
+        if os.path.exists(path):
+            os.remove(path)
+    print("PASS: legacy truncation, yield cursor, mismatch full")
+
+
 if __name__ == "__main__":
     test_extract_preserves_connector_json()
     test_prompt_cursor_and_truncation()
+    test_failover_new_thread_uses_full_history()
+    test_mismatch_and_legacy_full_truncation()
     print("ALL CHAT FIDELITY TESTS PASSED")
