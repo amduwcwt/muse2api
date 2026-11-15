@@ -1868,11 +1868,26 @@ class MuseEngine:
 
     @staticmethod
     def prompt_for_nav(prompt: str, full_prompt: str | None, nav: str, *,
-                       omitted: int = 0, before_chars: int = 0, limit: int = 0) -> str:
+                       omitted: int = 0, before_chars: int = 0, limit: int = 0,
+                       reason: str | None = None) -> str:
         """续用才发增量。新开线程（切号、打不开旧 session、nav=new/fresh/stale/rollover）改发全量。
 
+        无指纹且全文会超限时，调用方已经清掉旧 session。只在新线程上发截断后的全量。
         日志只有 nav 和字符数，不写正文。
         """
+        if reason == "legacy_long":
+            if nav in ("resumed", "reused"):
+                log.warning(
+                    "sidechat prompt legacy long-thread refused nav=%s limit=%s",
+                    nav, limit,
+                )
+                raise MuseGenerationError("legacy long thread refused resume")
+            sent = full_prompt if full_prompt else prompt
+            log.info(
+                "sidechat prompt legacy long-thread new prompt_chars=%s before_chars=%s omitted=%s limit=%s nav=%s",
+                len(sent), before_chars, omitted, limit, nav,
+            )
+            return sent
         if not full_prompt or nav in ("resumed", "reused"):
             return prompt
         if prompt != full_prompt:
@@ -1893,7 +1908,8 @@ class MuseEngine:
                     session_id: str | None = None, sidechat_label: str | None = None,
                     sidechat_state: dict | None = None,
                     full_prompt: str | None = None, full_omitted: int = 0,
-                    full_before_chars: int = 0, prompt_limit: int = 0):
+                    full_before_chars: int = 0, prompt_limit: int = 0,
+                    prompt_reason: str | None = None):
         """发一条消息，流式 yield 增量文本。
 
         session_id 有值时续用该旁聊；没有则策略 A，新开 /thread/new。
@@ -1916,6 +1932,7 @@ class MuseEngine:
             prompt = self.prompt_for_nav(
                 prompt, full_prompt, nav,
                 omitted=full_omitted, before_chars=full_before_chars, limit=prompt_limit,
+                reason=prompt_reason,
             )
             self._send(prompt)
 
