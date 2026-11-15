@@ -417,6 +417,42 @@ curl -X POST "http://localhost:18610/v1/images/edits" \
   -F "image=@style.png"
 ```
 
+### 2.1 按角色钉住生图 / 生视频账号
+
+`/v1/images/generations`、`/v1/images/edits`（JSON 和 multipart）、`/v1/images/tasks`、`/v1/videos` 和 `/v1/videos/generations` 可以像对话一样把这一次生成钉到某个账号。账号仍来自旁聊台账的 `role_account_map`（含 `default`），进程会按文件修改时间重新读盘，改映射不用重启。
+
+传入方式和对话相同的 slug 规则（1–64 位字母、数字、`_` 或 `-`，大小写不敏感）：
+
+1. 请求头 `X-Muse-Role`（优先）
+2. JSON 字段 `muse_role`，或 multipart 表单字段 `muse_role`
+
+`X-Muse-Project` / `muse_project` 可以一起带上，只做同样的 slug 校验。媒体请求**不会**写入旁聊台账，也不会打开 `/thread/:id`。只传 project 不传 role 会返回 400。
+
+```bash
+curl -X POST "http://localhost:18610/v1/images/generations" \
+  -H "Authorization: Bearer m2a_your_secret_key" \
+  -H "Content-Type: application/json" \
+  -H "X-Muse-Role: drama" \
+  -d '{
+    "model": "muse-image",
+    "prompt": "一张舞台剧海报，暖色灯光",
+    "response_format": "url"
+  }'
+```
+
+multipart 编辑用表单字段即可：`-F "muse_role=drama"`。视频任务同样带 `X-Muse-Role: drama`。
+
+- 角色在 `role_account_map` 里有账号，或只有 `default` 时，这一次只使用那个账号。账号正忙就等到本次 `timeout`，不会改用别的号。失败后最多在同一个账号上再试一次，**不会**轮转到其他账号。
+- 角色合法，但没有单独映射、也没有 `default` 时，仍按原来的方式在启用账号之间轮转，不报错。
+- slug 不合法返回 400，错误信息里带字段名（例如 `X-Muse-Role`）。
+- 映射的账号被禁用或不存在时返回 409，错误信息里写角色名，不返回 cookie，也不会悄悄换号。
+- 同步生图响应多一个 `muse`：`{"role": "drama", "account_id": "<账号 id>"}`。异步图片任务和视频任务在记录上写 `account`（实际跑的账号 id）和同样的 `muse`。这些字段不含 cookie、代理密码或会话内容。
+- 全局并发不变，仍由 `MUSE2API_CONCURRENCY`（`GEN_LOCK`）限制。钉住角色不会多开浏览器槽位，同一次请求也不会改用别的账号。
+
+```bash
+python tests/test_media_role_pin.py
+```
+
 ### 3. 文生视频 / 图生视频（Videos）
 
 - **第一步：创建生成任务**
@@ -430,7 +466,7 @@ curl -X POST "http://localhost:18610/v1/images/edits" \
       "size": "16:9"
     }'
   ```
-  返回任务 ID：`{"id": "task_xyz789", "status": "queued"}`
+  返回任务 ID：`{"id": "task_xyz789", "status": "queued"}`。要钉账号，加上请求头 `X-Muse-Role`（或 JSON 字段 `muse_role`），规则见上一节。
 
   多图参考视频在同一个请求中使用有序的 `images` 数组；这里支持的是多张图片作为视频参考，不支持上传视频文件作为参考：
   ```bash
