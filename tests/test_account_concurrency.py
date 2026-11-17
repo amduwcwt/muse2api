@@ -86,7 +86,7 @@ class FakeEngine:
 
 
 
-def _install(ids, limit=8, delay=0.4, queue_timeout=5):
+def _install(ids, limit=8, delay=0.4, queue_timeout=5, per_account=2):
     fake_store = FakeStore(ids)
     fake_engine = FakeEngine(delay)
     commits = []
@@ -101,6 +101,7 @@ def _install(ids, limit=8, delay=0.4, queue_timeout=5):
     app._commit_sidechat = lambda plan, state, aid, accept_cursor=False: commits.append(
         ((plan or {}).get("ledger_key"), aid, time.monotonic()))
     app.CFG.queue_timeout = queue_timeout
+    app.CFG.per_account_concurrency = per_account
     return fake_store, fake_engine, commits
 
 
@@ -114,6 +115,7 @@ def _run(results, name, *args, **kw):
 def test_config_parsing():
     import os
     old = os.environ.get("MUSE2API_CONCURRENCY")
+    slot = os.environ.get("MUSE2API_PER_ACCOUNT_CONCURRENCY")
     try:
         os.environ["MUSE2API_CONCURRENCY"] = "auto"
         assert config.concurrency_limit() == 0
@@ -125,12 +127,24 @@ def test_config_parsing():
         assert config.concurrency_limit() == 8
         os.environ.pop("MUSE2API_CONCURRENCY")
         assert config.concurrency_limit() == 8
+        os.environ["MUSE2API_PER_ACCOUNT_CONCURRENCY"] = "2"
+        assert config.per_account_concurrency_limit() == 2
+        os.environ["MUSE2API_PER_ACCOUNT_CONCURRENCY"] = "1"
+        assert config.per_account_concurrency_limit() == 1
+        os.environ["MUSE2API_PER_ACCOUNT_CONCURRENCY"] = "0"
+        assert config.per_account_concurrency_limit() == 1
+        os.environ["MUSE2API_PER_ACCOUNT_CONCURRENCY"] = "nope"
+        assert config.per_account_concurrency_limit() == 2
     finally:
         if old is None:
             os.environ.pop("MUSE2API_CONCURRENCY", None)
         else:
             os.environ["MUSE2API_CONCURRENCY"] = old
-    print("PASS: MUSE2API_CONCURRENCY parsing (int / auto)")
+        if slot is None:
+            os.environ.pop("MUSE2API_PER_ACCOUNT_CONCURRENCY", None)
+        else:
+            os.environ["MUSE2API_PER_ACCOUNT_CONCURRENCY"] = slot
+    print("PASS: MUSE2API_CONCURRENCY parsing (int / auto / per-account)")
 
 
 def test_dynamic_limit_and_cap():
@@ -166,7 +180,7 @@ def test_different_accounts_run_in_parallel():
 
 
 def test_same_account_is_serialized_not_rotated():
-    st, eng, _ = _install(["a1", "a2"], limit=3)
+    st, eng, _ = _install(["a1", "a2"], limit=3, per_account=1)
     res = {}
     ts = [threading.Thread(target=_run, args=(res, i, {}, f"p{i}", None, 30, "a1"))
           for i in range(3)]
@@ -176,7 +190,7 @@ def test_same_account_is_serialized_not_rotated():
     assert eng.peak_per_account == {"a1": 1}, eng.peak_per_account
     assert all(c[0] == "a1" for c in eng.calls), eng.calls
     assert st.picked == [], st.picked  # 没有因为忙去挑别的号
-    print("PASS: same account runs one at a time and never switches account when busy")
+    print("PASS: per-account limit 1 runs one at a time and never switches account")
 
 
 def test_global_limit_bounds_parallelism():
@@ -192,7 +206,7 @@ def test_global_limit_bounds_parallelism():
 
 
 def test_busy_account_queue_timeout_no_failover():
-    st, eng, commits = _install(["a1", "a2"], limit=3, delay=1.5, queue_timeout=1)
+    st, eng, commits = _install(["a1", "a2"], limit=3, delay=1.5, queue_timeout=1, per_account=1)
     res = {}
     first = threading.Thread(target=_run, args=(res, "first", {}, "p1", None, 30, "a1"))
     first.start()
@@ -398,18 +412,22 @@ def test_existing_sidechat_keeps_its_account():
     release = threading.Event()
 
     def gate(_account_id, prompt):
-        if prompt == "hold":
+        if str(prompt).startswith("hold"):
             release.wait(3)
 
     eng.gate = gate
     try:
         res = {}
-        hold = threading.Thread(target=_run, args=(res, "hold", {}, "hold", None, 30, "a2"))
-        hold.start()
+        holders = []
+        for index in range(app.CFG.per_account_concurrency):
+            thread = threading.Thread(
+                target=_run, args=(res, f"hold-{index}", {}, f"hold-{index}", None, 30, "a2"))
+            holders.append(thread)
+            thread.start()
         deadline = time.monotonic() + 2
-        while time.monotonic() < deadline and not any(call[1] == "hold" for call in eng.calls):
+        while time.monotonic() < deadline and len(eng.calls) < len(holders):
             time.sleep(0.02)
-        assert any(call[1] == "hold" for call in eng.calls), eng.calls
+        assert len(eng.calls) == len(holders), eng.calls
         acc, plan = app._route_chat_account("ops", "ticket")
         assert plan["spread_idle"] is False
         assert plan["account_id"] == "a2"
@@ -421,13 +439,14 @@ def test_existing_sidechat_keeps_its_account():
         )
         ticket.start()
         time.sleep(0.3)
-        assert [call[1] for call in eng.calls] == ["hold"], eng.calls
+        assert all(not str(call[1]).startswith("ticket") for call in eng.calls), eng.calls
         release.set()
-        hold.join(3)
+        for thread in holders:
+            thread.join(3)
         ticket.join(3)
         assert res["ticket"] == "reply:ticket", res
         assert [call[0] for call in eng.calls if call[1] == "ticket"] == ["a2"]
-        assert eng.peak_per_account["a2"] == 1
+        assert eng.peak_per_account["a2"] == app.CFG.per_account_concurrency
         assert all(call[0] != "a1" for call in eng.calls)
         snap = app.ledger.snapshot()
         assert snap["role_account_map"] == {"ops": "a1"}
@@ -440,9 +459,9 @@ def test_existing_sidechat_keeps_its_account():
     print("PASS: existing sidechat keeps its original account")
 
 
-def test_new_ticket_queues_when_no_account_is_idle():
-    """没有空闲号时排队，不抢占正在忙的账号，超时不写台账。"""
-    _, eng, commits = _install(["a1", "a2", "a3"], limit=4, queue_timeout=5)
+def test_new_ticket_queues_when_every_account_is_full():
+    """每个号都到了单号上限才排队。没满不抢，超时不写台账。"""
+    _, eng, commits = _install(["a1", "a2", "a3"], limit=4, queue_timeout=5, per_account=2)
     app.store.accounts[2]["ok"] = False
     path, old, os_mod = _temp_ledger()
     app.ledger.set_role_account("ops", "a1")
@@ -457,14 +476,15 @@ def test_new_ticket_queues_when_no_account_is_idle():
         res = {}
         holders = []
         for aid in ("a1", "a2"):
-            thread = threading.Thread(
-                target=_run, args=(res, aid, {}, f"hold-{aid}", None, 30, aid))
-            holders.append(thread)
-            thread.start()
+            for slot in range(app.CFG.per_account_concurrency):
+                thread = threading.Thread(
+                    target=_run, args=(res, f"{aid}-{slot}", {}, f"hold-{aid}-{slot}", None, 30, aid))
+                holders.append(thread)
+                thread.start()
         deadline = time.monotonic() + 2
-        while time.monotonic() < deadline and len(eng.calls) < 2:
+        while time.monotonic() < deadline and len(eng.calls) < len(holders):
             time.sleep(0.02)
-        assert len(eng.calls) == 2, eng.calls
+        assert len(eng.calls) == len(holders), eng.calls
 
         app.CFG.queue_timeout = 0.4
 
@@ -480,8 +500,8 @@ def test_new_ticket_queues_when_no_account_is_idle():
         assert "排队超时" in str(res["late"])
         assert not any(call[1] == "late" for call in eng.calls), eng.calls
         assert not any(key == "role:ops:proj:late" for key, _, _ in commits), commits
-        assert eng.peak_per_account.get("a1") == 1
-        assert eng.peak_per_account.get("a2") == 1
+        assert eng.peak_per_account.get("a1") == 2
+        assert eng.peak_per_account.get("a2") == 2
 
         app.CFG.queue_timeout = 5
 
@@ -500,14 +520,119 @@ def test_new_ticket_queues_when_no_account_is_idle():
         assert res["fresh"] == "reply:fresh", res
         fresh_accounts = [call[0] for call in eng.calls if call[1] == "fresh"]
         assert fresh_accounts in (["a1"], ["a2"]), fresh_accounts
-        assert eng.peak_per_account["a1"] == 1
-        assert eng.peak_per_account["a2"] == 1
+        assert eng.peak_per_account["a1"] == 2
+        assert eng.peak_per_account["a2"] == 2
         assert "a3" not in [call[0] for call in eng.calls]
         assert app.ledger.snapshot()["role_account_map"] == {"ops": "a1"}
     finally:
         release.set()
         _restore_ledger(path, old, os_mod)
-    print("PASS: no idle account queues instead of preempting")
+    print("PASS: full accounts queue instead of taking another slot")
+
+
+def test_two_tickets_share_one_account_third_queues():
+    """单号上限 2：两条不同工单可以叠在同一个号上，第三条排队且不写台账。"""
+    _, eng, commits = _install(["a1"], limit=4, queue_timeout=5, per_account=2)
+    path, old, os_mod = _temp_ledger()
+    app.ledger.set_role_account("ops", "a1")
+    both = threading.Event()
+    release = threading.Event()
+
+    def gate(_account_id, prompt):
+        if prompt in ("t1", "t2"):
+            if sum(1 for call in eng.calls if call[1] in ("t1", "t2")) >= 2:
+                both.set()
+            assert both.wait(2), eng.calls
+            release.wait(3)
+
+    eng.gate = gate
+    try:
+        res = {}
+
+        def go(project):
+            acc, plan = app._route_chat_account("ops", project)
+            _run(res, project, acc["cookies"], project, None, 30, acc["id"], sidechat=plan)
+
+        threads = [threading.Thread(target=go, args=(name,)) for name in ("t1", "t2")]
+        for thread in threads:
+            thread.start()
+        assert both.wait(2), eng.calls
+        assert eng.peak_per_account["a1"] == 2
+        assert {call[0] for call in eng.calls} == {"a1"}
+
+        app.CFG.queue_timeout = 0.4
+
+        def third():
+            acc, plan = app._route_chat_account("ops", "t3")
+            _run(res, "t3", acc["cookies"], "t3", None, 30, acc["id"], sidechat=plan)
+
+        late = threading.Thread(target=third)
+        late.start()
+        late.join(2)
+        assert isinstance(res["t3"], app.MuseQueueTimeout), res.get("t3")
+        assert "排队超时" in str(res["t3"])
+        assert not any(call[1] == "t3" for call in eng.calls), eng.calls
+        assert not any(key == "role:ops:proj:t3" for key, _, _ in commits), commits
+        assert app.ledger.snapshot()["role_account_map"] == {"ops": "a1"}
+        release.set()
+        for thread in threads:
+            thread.join(3)
+        assert res["t1"] == "reply:t1" and res["t2"] == "reply:t2"
+    finally:
+        both.set()
+        release.set()
+        _restore_ledger(path, old, os_mod)
+    print("PASS: two tickets share one account; the third queues")
+
+
+def test_same_ticket_never_overlaps():
+    """单号还能再塞一条时，同一工单仍然不能并发；别的工单可以。"""
+    _, eng, _ = _install(["a1"], limit=4, queue_timeout=5, per_account=2)
+    release = threading.Event()
+
+    def gate(_account_id, prompt):
+        if prompt == "first":
+            release.wait(3)
+
+    eng.gate = gate
+    res = {}
+    same = "role:ops:proj:same"
+
+    def run(name, ledger_key):
+        lease = app.SIDECHAT_GATE.acquire(ledger_key, time.monotonic() + 5)
+        _run(res, name, {}, name, None, 30, "a1", lease=lease)
+
+    try:
+        first = threading.Thread(target=run, args=("first", same))
+        first.start()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not any(call[1] == "first" for call in eng.calls):
+            time.sleep(0.02)
+        assert any(call[1] == "first" for call in eng.calls), eng.calls
+        second = threading.Thread(target=run, args=("second", same))
+        other = threading.Thread(target=run, args=("other", "role:ops:proj:other"))
+        second.start()
+        other.start()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not any(call[1] == "other" for call in eng.calls):
+            time.sleep(0.02)
+        time.sleep(0.2)
+        prompts = [call[1] for call in eng.calls]
+        assert "first" in prompts and "other" in prompts
+        assert "second" not in prompts, prompts
+        assert eng.peak_per_account["a1"] == 2
+        release.set()
+        first.join(3)
+        second.join(3)
+        other.join(3)
+        assert res["first"] == "reply:first", res
+        assert res["second"] == "reply:second", res
+        assert res["other"] == "reply:other", res
+        assert eng.peak_per_account["a1"] == 2
+        assert app.SIDECHAT_GATE.snapshot() == {"held": [], "waiting": {}}
+    finally:
+        release.set()
+    print("PASS: same ticket never overlaps; another ticket can share the account")
 
 
 if __name__ == "__main__":
@@ -521,6 +646,8 @@ if __name__ == "__main__":
     test_sidechat_gate()
     test_concurrent_new_tickets_get_different_accounts()
     test_existing_sidechat_keeps_its_account()
-    test_new_ticket_queues_when_no_account_is_idle()
+    test_new_ticket_queues_when_every_account_is_full()
+    test_two_tickets_share_one_account_third_queues()
+    test_same_ticket_never_overlaps()
     test_endpoint_same_sidechat_waits_for_commit()
     print("ALL ACCOUNT CONCURRENCY TESTS PASSED")

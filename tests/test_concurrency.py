@@ -57,7 +57,8 @@ def test_account_pool_manager():
         )
     )
 
-    pool = app.AccountPoolManager(dummy_store)
+    # limit=1 是旧的「一号一次」。默认 2 的共享行为在 test_account_concurrency.py。
+    pool = app.AccountPoolManager(dummy_store, limit=1)
 
     # 线程 1 占用 acc-1
     a1 = pool.acquire(timeout=0.5)

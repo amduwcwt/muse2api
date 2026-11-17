@@ -260,11 +260,38 @@ class SidechatGate:
 
 
 class AccountPoolManager:
-    """账号并发冲突管理器：确保同一账号不会同时被两个并发任务操作，多账号则并行执行。"""
-    def __init__(self, store_instance):
+    """账号并发调度：每个账号同时最多 N 条请求（默认 2），多账号并行。
+
+    busy_accounts 仍是「当前有请求在跑」的账号集合。inflight 是每个号上的条数。
+    exclusive 是维护操作，占满该号，别人要等它结束。
+    """
+    def __init__(self, store_instance, limit: int | None = None):
         self.store = store_instance
         self.busy_accounts: set[str] = set()
+        self.inflight: dict[str, int] = {}
+        self.exclusive: set[str] = set()
         self.cond = threading.Condition()
+        self._limit_override = None if limit is None else max(1, int(limit))
+
+    def limit(self) -> int:
+        if self._limit_override:
+            return self._limit_override
+        try:
+            return max(1, int(CFG.per_account_concurrency))
+        except (TypeError, ValueError):
+            return 2
+
+    def _load(self, account_id: str | None) -> int:
+        if not account_id:
+            return 0
+        return self.inflight.get(account_id, 0)
+
+    def _under_limit(self, account_id: str) -> bool:
+        return account_id not in self.exclusive and self._load(account_id) < self.limit()
+
+    def _hold(self, account_id: str) -> None:
+        self.inflight[account_id] = self._load(account_id) + 1
+        self.busy_accounts.add(account_id)
 
     def acquire(self, account_id: str | None = None, preferred_id: str | None = None,
                 rotate: bool = True, force_rotate: bool = False,
@@ -280,20 +307,29 @@ class AccountPoolManager:
                     acc = self.store.get_account(account_id)
                     if not acc or not acc.get("enabled", True):
                         raise MuseAuthError(f"指定账号 {account_id} 不存在或已禁用")
-                    if account_id not in self.busy_accounts:
-                        self.busy_accounts.add(account_id)
+                    # 指定号（含已有旁聊）只在这个号上排队，满员也不改去别的号。
+                    if self._under_limit(account_id):
+                        self._hold(account_id)
                         return acc
-                else:
-                    pref = preferred_id if preferred_id not in self.busy_accounts else None
+                elif force_rotate:
+                    # 故障切换仍优先找一个当前没在跑请求的号，避免改掉原来的切号路径。
                     acc = self.store.pick_account(
-                        preferred_id=pref,
+                        preferred_id=None,
                         rotate=rotate,
-                        force_rotate=force_rotate,
-                        exclude_ids=self.busy_accounts,
+                        force_rotate=True,
+                        exclude_ids=set(self.busy_accounts) | set(self.exclusive),
                         record_use=record_use,
                     )
+                    if acc and self._under_limit(acc["id"]):
+                        self._hold(acc["id"])
+                        return acc
+                else:
+                    acc = self._claim_least_loaded(
+                        preferred_id=preferred_id,
+                        session_valid_only=False,
+                    )
                     if acc:
-                        self.busy_accounts.add(acc["id"])
+                        self._hold(acc["id"])
                         return acc
 
                 live = [a for a in self.store.accounts if a.get("enabled", True) and a.get("cookies")]
@@ -315,12 +351,41 @@ class AccountPoolManager:
             return False
         return True
 
+    def _claim_least_loaded(self, preferred_id: str | None,
+                            session_valid_only: bool) -> dict | None:
+        """负载最低的合格账号。同负载时映射账号优先，然后才是其他号。
+
+        调用方必须已持有 self.cond。这里不占号。
+        """
+        usable = []
+        for account in self.store.accounts:
+            if session_valid_only:
+                if not self._session_valid(account):
+                    continue
+            elif not account or not account.get("id"):
+                continue
+            elif not account.get("enabled", True) or not account.get("cookies"):
+                continue
+            if not self._under_limit(account["id"]):
+                continue
+            usable.append(account)
+        if not usable:
+            return None
+        usable.sort(key=lambda account: (
+            self._load(account["id"]),
+            0 if preferred_id and account.get("id") == preferred_id else 1,
+            account.get("last_used") or 0,
+            account.get("use_count") or 0,
+            str(account.get("id")),
+        ))
+        return usable[0]
+
     def claim_idle(self, preferred_id: str | None = None, timeout: float = 60.0,
                    cancel_events=()) -> dict | None:
-        """新建工单占用一个当前空闲且会话有效的账号。
+        """新建工单占一个还没到上限、会话有效的账号。
 
-        偏好账号（role_account_map）如果正空闲就用它，否则用最久没用的空闲号。
-        一个空闲号都没有时排队，直到有号空出来或超时；不把请求塞进正在忙的账号。
+        先拿负载最低的（空闲优先）。负载相同时，映射账号优先于其他号。
+        每个号都到了 MUSE2API_PER_ACCOUNT_CONCURRENCY 才排队。
         客户端已经断开时返回 None，不占号。
         """
         deadline = time.monotonic() + max(0.0, float(timeout))
@@ -329,33 +394,37 @@ class AccountPoolManager:
             while True:
                 if any(ev.is_set() for ev in events):
                     return None
-                usable = [a for a in self.store.accounts if self._session_valid(a)]
-                idle = [a for a in usable if a["id"] not in self.busy_accounts]
-                if idle:
-                    by_id = {a["id"]: a for a in idle}
-                    if preferred_id and preferred_id in by_id:
-                        chosen = by_id[preferred_id]
-                    else:
-                        chosen = sorted(idle, key=lambda a: (
-                            a.get("last_used") or 0,
-                            a.get("use_count") or 0,
-                            str(a.get("id")),
-                        ))[0]
-                    self.busy_accounts.add(chosen["id"])
+                chosen = self._claim_least_loaded(
+                    preferred_id=preferred_id,
+                    session_valid_only=True,
+                )
+                if chosen:
+                    self._hold(chosen["id"])
                     return chosen
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise MuseQueueTimeout(
-                        f"没有空闲账号可接新工单（偏好 {_account_label(preferred_id)}），"
-                        f"排队超时（{CFG.queue_timeout}s），本条未发送；"
-                        "不会抢占正在忙的账号，请稍后重试")
+                        f"账号都已达到同时 {self.limit()} 个请求的上限"
+                        f"（偏好 {_account_label(preferred_id)}），"
+                        f"排队超时（{CFG.queue_timeout}s），本条未发送；请稍后重试")
                 self.cond.wait(timeout=min(remaining, 0.5))
 
     def release(self, account_id: str | None):
         if not account_id:
             return
         with self.cond:
-            self.busy_accounts.discard(account_id)
+            if account_id in self.exclusive:
+                self.exclusive.discard(account_id)
+                if self._load(account_id) <= 0:
+                    self.busy_accounts.discard(account_id)
+                self.cond.notify_all()
+                return
+            current = self._load(account_id)
+            if current <= 1:
+                self.inflight.pop(account_id, None)
+                self.busy_accounts.discard(account_id)
+            else:
+                self.inflight[account_id] = current - 1
             self.cond.notify_all()
 
 
@@ -404,8 +473,9 @@ def _account_operation(aid: str):
         account = store.get_account(aid)
         if not account:
             raise HTTPException(404, "账号不存在")
-        if aid in ACCOUNT_POOL.busy_accounts:
+        if aid in ACCOUNT_POOL.busy_accounts or aid in ACCOUNT_POOL.exclusive:
             raise HTTPException(409, "账号正在执行任务或检测，请稍后再试")
+        ACCOUNT_POOL.exclusive.add(aid)
         ACCOUNT_POOL.busy_accounts.add(aid)
         account = copy.deepcopy(account)
     try:
@@ -870,8 +940,8 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
     一轮结束（含中断和异常）时调用 on_finished 一次。回调失败不影响吐字。
     排队（等本账号空闲、等全局槽位）共用 queue_deadline；超时报 MuseQueueTimeout，
     不换号、不写台账。lease 是本旁聊的占用，worker 结束（台账已写回）后释放。
-    新建工单（plan.spread_idle）先占一个当前空闲的号，偏好账号只在它也空闲时使用；
-    没有空闲号就排队，不抢占正在忙的账号。已有旁聊不改账号。
+    新建工单（plan.spread_idle）占负载最低、还没到单号上限的账号；映射账号在负载相同时优先。
+    每个号都满了才排队。已有旁聊不改账号，本号满了就在本号上排队。
     account_holder 若传入，会写成实际占用的账号 id，供调用方标记状态。"""
     import queue
     if queue_deadline is None:
@@ -1003,7 +1073,7 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                         break
                     except MuseGenerationError:
                         last_exc = MuseQueueTimeout(
-                            f"账号 {_account_label(cur_id)} 正在处理别的请求（同一账号同时只跑一个），"
+                            f"账号 {_account_label(cur_id)} 已达到同时 {ACCOUNT_POOL.limit()} 个请求的上限，"
                             f"排队超时（{CFG.queue_timeout}s），本条未发送；不会换号，请稍后重试")
                         break
                     if account_holder is not None and cur_id:
@@ -3218,6 +3288,8 @@ def _concurrency_status() -> dict:
         "cap": CFG.concurrency_cap,
         "active": GEN_LOCK.active,
         "busy_accounts": busy,
+        "per_account_limit": ACCOUNT_POOL.limit(),
+        "account_inflight": dict(ACCOUNT_POOL.inflight),
         "usable_accounts": _usable_account_count(),
         "queue_timeout": CFG.queue_timeout,
         "sidechats": SIDECHAT_GATE.snapshot(),
