@@ -260,11 +260,38 @@ class SidechatGate:
 
 
 class AccountPoolManager:
-    """账号并发冲突管理器：确保同一账号不会同时被两个并发任务操作，多账号则并行执行。"""
-    def __init__(self, store_instance):
+    """账号并发调度：每个账号同时最多 N 条请求（默认 2），多账号并行。
+
+    busy_accounts 仍是「当前有请求在跑」的账号集合。inflight 是每个号上的条数。
+    exclusive 是维护操作，占满该号，别人要等它结束。
+    """
+    def __init__(self, store_instance, limit: int | None = None):
         self.store = store_instance
         self.busy_accounts: set[str] = set()
+        self.inflight: dict[str, int] = {}
+        self.exclusive: set[str] = set()
         self.cond = threading.Condition()
+        self._limit_override = None if limit is None else max(1, int(limit))
+
+    def limit(self) -> int:
+        if self._limit_override:
+            return self._limit_override
+        try:
+            return max(1, int(CFG.per_account_concurrency))
+        except (TypeError, ValueError):
+            return 2
+
+    def _load(self, account_id: str | None) -> int:
+        if not account_id:
+            return 0
+        return self.inflight.get(account_id, 0)
+
+    def _under_limit(self, account_id: str) -> bool:
+        return account_id not in self.exclusive and self._load(account_id) < self.limit()
+
+    def _hold(self, account_id: str) -> None:
+        self.inflight[account_id] = self._load(account_id) + 1
+        self.busy_accounts.add(account_id)
 
     def acquire(self, account_id: str | None = None, preferred_id: str | None = None,
                 rotate: bool = True, force_rotate: bool = False,
@@ -280,20 +307,29 @@ class AccountPoolManager:
                     acc = self.store.get_account(account_id)
                     if not acc or not acc.get("enabled", True):
                         raise MuseAuthError(f"指定账号 {account_id} 不存在或已禁用")
-                    if account_id not in self.busy_accounts:
-                        self.busy_accounts.add(account_id)
+                    # 指定号（含已有旁聊）只在这个号上排队，满员也不改去别的号。
+                    if self._under_limit(account_id):
+                        self._hold(account_id)
                         return acc
-                else:
-                    pref = preferred_id if preferred_id not in self.busy_accounts else None
+                elif force_rotate:
+                    # 故障切换仍优先找一个当前没在跑请求的号，避免改掉原来的切号路径。
                     acc = self.store.pick_account(
-                        preferred_id=pref,
+                        preferred_id=None,
                         rotate=rotate,
-                        force_rotate=force_rotate,
-                        exclude_ids=self.busy_accounts,
+                        force_rotate=True,
+                        exclude_ids=set(self.busy_accounts) | set(self.exclusive),
                         record_use=record_use,
                     )
+                    if acc and self._under_limit(acc["id"]):
+                        self._hold(acc["id"])
+                        return acc
+                else:
+                    acc = self._claim_least_loaded(
+                        preferred_id=preferred_id,
+                        session_valid_only=False,
+                    )
                     if acc:
-                        self.busy_accounts.add(acc["id"])
+                        self._hold(acc["id"])
                         return acc
 
                 live = [a for a in self.store.accounts if a.get("enabled", True) and a.get("cookies")]
@@ -302,11 +338,93 @@ class AccountPoolManager:
 
                 self.cond.wait(timeout=min(remaining, 0.5))
 
+    @staticmethod
+    def _session_valid(acc: dict | None) -> bool:
+        """启用、有 cookie、没被标坏。ok 还是 None（没探测过）算有效。"""
+        if not acc or not acc.get("id"):
+            return False
+        if not acc.get("enabled", True):
+            return False
+        if not acc.get("cookies"):
+            return False
+        if acc.get("ok") is False:
+            return False
+        return True
+
+    def _claim_least_loaded(self, preferred_id: str | None,
+                            session_valid_only: bool) -> dict | None:
+        """负载最低的合格账号。同负载时映射账号优先，然后才是其他号。
+
+        调用方必须已持有 self.cond。这里不占号。
+        """
+        usable = []
+        for account in self.store.accounts:
+            if session_valid_only:
+                if not self._session_valid(account):
+                    continue
+            elif not account or not account.get("id"):
+                continue
+            elif not account.get("enabled", True) or not account.get("cookies"):
+                continue
+            if not self._under_limit(account["id"]):
+                continue
+            usable.append(account)
+        if not usable:
+            return None
+        usable.sort(key=lambda account: (
+            self._load(account["id"]),
+            0 if preferred_id and account.get("id") == preferred_id else 1,
+            account.get("last_used") or 0,
+            account.get("use_count") or 0,
+            str(account.get("id")),
+        ))
+        return usable[0]
+
+    def claim_idle(self, preferred_id: str | None = None, timeout: float = 60.0,
+                   cancel_events=()) -> dict | None:
+        """新建工单占一个还没到上限、会话有效的账号。
+
+        先拿负载最低的（空闲优先）。负载相同时，映射账号优先于其他号。
+        每个号都到了 MUSE2API_PER_ACCOUNT_CONCURRENCY 才排队。
+        客户端已经断开时返回 None，不占号。
+        """
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        events = tuple(ev for ev in (cancel_events or ()) if ev is not None)
+        with self.cond:
+            while True:
+                if any(ev.is_set() for ev in events):
+                    return None
+                chosen = self._claim_least_loaded(
+                    preferred_id=preferred_id,
+                    session_valid_only=True,
+                )
+                if chosen:
+                    self._hold(chosen["id"])
+                    return chosen
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise MuseQueueTimeout(
+                        f"账号都已达到同时 {self.limit()} 个请求的上限"
+                        f"（偏好 {_account_label(preferred_id)}），"
+                        f"排队超时（{CFG.queue_timeout}s），本条未发送；请稍后重试")
+                self.cond.wait(timeout=min(remaining, 0.5))
+
     def release(self, account_id: str | None):
         if not account_id:
             return
         with self.cond:
-            self.busy_accounts.discard(account_id)
+            if account_id in self.exclusive:
+                self.exclusive.discard(account_id)
+                if self._load(account_id) <= 0:
+                    self.busy_accounts.discard(account_id)
+                self.cond.notify_all()
+                return
+            current = self._load(account_id)
+            if current <= 1:
+                self.inflight.pop(account_id, None)
+                self.busy_accounts.discard(account_id)
+            else:
+                self.inflight[account_id] = current - 1
             self.cond.notify_all()
 
 
@@ -355,8 +473,9 @@ def _account_operation(aid: str):
         account = store.get_account(aid)
         if not account:
             raise HTTPException(404, "账号不存在")
-        if aid in ACCOUNT_POOL.busy_accounts:
+        if aid in ACCOUNT_POOL.busy_accounts or aid in ACCOUNT_POOL.exclusive:
             raise HTTPException(409, "账号正在执行任务或检测，请稍后再试")
+        ACCOUNT_POOL.exclusive.add(aid)
         ACCOUNT_POOL.busy_accounts.add(aid)
         account = copy.deepcopy(account)
     try:
@@ -569,23 +688,47 @@ def _chat_dimensions(req, header_role, header_project):
         raise HTTPException(400, str(exc)) from exc
 
 
+def _new_ticket_spread(plan: dict) -> bool:
+    """没有可续用的旁聊时，才允许改去当前空闲的号。
+
+    已有 session、翻页、条目上钉住的账号，以及故障切换已经选定的号，都保持不动。
+    """
+    if plan.get("session_id"):
+        return False
+    if plan.get("failover"):
+        return False
+    if plan.get("reason") in ("resume", "rollover", "entry"):
+        return False
+    return plan.get("reason") in ("role_map", "assign")
+
+
 def _route_chat_account(role: str | None, project: str | None):
-    """无 role/project 走策略 A（轮转账号 + 每次新旁聊）。有则按台账钉账号。"""
+    """无 role/project 走策略 A（轮转账号 + 每次新旁聊）。
+
+    有 role 时：已经有旁聊的工单钉住原账号。新建工单仍把 role_account_map
+    当作偏好账号返回；真正占号在 worker 里挑当前空闲的号，没有空闲就排队。
+    """
     plan = None
     if role or project:
         plan = ledger.plan(role, project, _sidechat_accounts())
     if plan and plan.get("strategy") == "bc" and plan.get("account_id"):
-        acc = store.pick_account(preferred_id=plan["account_id"], rotate=False)
+        plan = dict(plan)
+        plan["spread_idle"] = _new_ticket_spread(plan)
+        # 新建工单还没真正占号，不要先把偏好账号记成已使用。
+        acc = store.pick_account(
+            preferred_id=plan["account_id"], rotate=False,
+            record_use=not plan["spread_idle"],
+        )
         if not acc:
             raise HTTPException(400, "没有可用账号，请先在管理页面导入 cookie")
         if acc["id"] != plan["account_id"]:
             retired = plan.get("session_id") or plan.get("retire_session_id")
-            plan = dict(plan)
             plan["account_id"] = acc["id"]
             plan["account_label"] = acc.get("label") or ""
             plan["session_id"] = None
             plan["failover"] = True
             plan["reason"] = "failover"
+            plan["spread_idle"] = False
             if retired:
                 plan["retire_session_id"] = retired
         return acc, plan
@@ -787,7 +930,8 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                      stop_event: threading.Event | None = None,
                      client_gone: threading.Event | None = None,
                      lease: "SidechatLease | None" = None,
-                     queue_deadline: float | None = None):
+                     queue_deadline: float | None = None,
+                     account_holder: dict | None = None):
     """在独立线程中执行 chat_stream 并持有 GEN_LOCK，通过 Queue 往外吐。
     无论下游客户端何时断连、异常或超时，stop_event + finally 块保证 100% 立即释放 GEN_LOCK，绝不死锁。
     若首字前遇到单账号 VM 卡死或会话异常，且客户端还在，自动切换下一个健康账号重试一次。
@@ -795,7 +939,10 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
     换号时丢掉原来的 sessionId（旁聊不能跨账号续用）。
     一轮结束（含中断和异常）时调用 on_finished 一次。回调失败不影响吐字。
     排队（等本账号空闲、等全局槽位）共用 queue_deadline；超时报 MuseQueueTimeout，
-    不换号、不写台账。lease 是本旁聊的占用，worker 结束（台账已写回）后释放。"""
+    不换号、不写台账。lease 是本旁聊的占用，worker 结束（台账已写回）后释放。
+    新建工单（plan.spread_idle）占负载最低、还没到单号上限的账号；映射账号在负载相同时优先。
+    每个号都满了才排队。已有旁聊不改账号，本号满了就在本号上排队。
+    account_holder 若传入，会写成实际占用的账号 id，供调用方标记状态。"""
     import queue
     if queue_deadline is None:
         queue_deadline = time.monotonic() + CFG.queue_timeout
@@ -887,19 +1034,50 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                         plan["account_id"] = cur_id
                         if retired:
                             plan["retire_session_id"] = retired
-                elif cur_id:
+                elif cur_id or (plan and plan.get("spread_idle")):
                     try:
-                        ACCOUNT_POOL.acquire(account_id=cur_id,
-                                             timeout=_queue_left(queue_deadline))
+                        if attempt == 0 and plan and plan.get("spread_idle"):
+                            if client_left():
+                                return
+                            preferred_id = plan.get("account_id") or cur_id
+                            alt = ACCOUNT_POOL.claim_idle(
+                                preferred_id=preferred_id,
+                                timeout=_queue_left(queue_deadline),
+                                cancel_events=(client_gone, stop_event),
+                            )
+                            if alt is None:
+                                log.info("chat client gone skip idle claim")
+                                return
+                            cur_id = alt["id"]
+                            leased_id = cur_id
+                            cur_cookies = alt.get("cookies") or cur_cookies
+                            cur_exp = alt.get("cookies_exp")
+                            if plan.get("account_id") != cur_id:
+                                log.info(
+                                    "sidechat new ticket idle account=%s preferred=%s",
+                                    cur_id, preferred_id,
+                                )
+                                plan["account_id"] = cur_id
+                                plan["account_label"] = alt.get("label") or ""
+                                if plan.get("reason") == "role_map":
+                                    plan["reason"] = "idle"
+                        else:
+                            ACCOUNT_POOL.acquire(account_id=cur_id,
+                                                 timeout=_queue_left(queue_deadline))
+                            leased_id = cur_id
                     except MuseAuthError as exc:
+                        last_exc = exc
+                        break
+                    except MuseQueueTimeout as exc:
                         last_exc = exc
                         break
                     except MuseGenerationError:
                         last_exc = MuseQueueTimeout(
-                            f"账号 {_account_label(cur_id)} 正在处理别的请求（同一账号同时只跑一个），"
+                            f"账号 {_account_label(cur_id)} 已达到同时 {ACCOUNT_POOL.limit()} 个请求的上限，"
                             f"排队超时（{CFG.queue_timeout}s），本条未发送；不会换号，请稍后重试")
                         break
-                    leased_id = cur_id
+                    if account_holder is not None and cur_id:
+                        account_holder["id"] = cur_id
 
                 yielded = False
                 state.clear()
@@ -2587,6 +2765,7 @@ async def chat_completions(
         acc_id = acc["id"]
         cookies = acc["cookies"]
         expires = acc.get("cookies_exp")
+        account_holder = {"id": acc_id}
         relay_messages = list(req.messages)
         if not relay_messages and req.prompt:
             relay_messages = [ChatMessage(role="user", content=req.prompt)]
@@ -2625,6 +2804,7 @@ async def chat_completions(
                     chat_model=model, sidechat=sidechat, on_finished=on_finished,
                     stop_event=stop_event, client_gone=client_gone,
                     lease=lease, queue_deadline=queue_deadline,
+                    account_holder=account_holder,
                     **thread_args)
                 if not tool_note:
                     for chunk in stream_gen:
@@ -2671,14 +2851,14 @@ async def chat_completions(
                                 "choices": [],
                                 "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}})
                 yield "data: [DONE]\n\n"
-                store.mark(acc_id, True, "")
+                store.mark(account_holder["id"], True, "")
             except MuseQueueTimeout as exc:
                 yield _sse({"error": {"message": str(exc), "type": "server_error", "code": 503}})
             except MuseAuthError as exc:
-                store.mark(acc_id, False, str(exc))
+                store.mark(account_holder["id"], False, str(exc))
                 yield _sse({"error": {"message": str(exc), "type": "auth_error", "code": 401}})
             except MuseGenerationError as exc:
-                store.mark(acc_id, True, f"助手超时: {str(exc)[:60]}")
+                store.mark(account_holder["id"], True, f"助手超时: {str(exc)[:60]}")
                 try:
                     engine.reset_thread()
                 except Exception:
@@ -2702,6 +2882,7 @@ async def chat_completions(
                 chat_model=model, sidechat=sidechat, on_finished=on_finished,
                 stop_event=stop_event, client_gone=client_gone,
                 lease=lease, queue_deadline=queue_deadline,
+                account_holder=account_holder,
                 **thread_args))
         finally:
             lease.release_if_unstarted()
@@ -3107,6 +3288,8 @@ def _concurrency_status() -> dict:
         "cap": CFG.concurrency_cap,
         "active": GEN_LOCK.active,
         "busy_accounts": busy,
+        "per_account_limit": ACCOUNT_POOL.limit(),
+        "account_inflight": dict(ACCOUNT_POOL.inflight),
         "usable_accounts": _usable_account_count(),
         "queue_timeout": CFG.queue_timeout,
         "sidechats": SIDECHAT_GATE.snapshot(),
