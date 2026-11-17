@@ -54,6 +54,7 @@ class FakeEngine:
         self.total = 0
         self.calls = []
         self.chat_warmup_sent = False
+        self.gate = None  # (account_id, prompt) -> None，占着号时调用
 
     def start(self):
         pass
@@ -73,12 +74,16 @@ class FakeEngine:
             self.peak_total = max(self.peak_total, self.total)
             self.calls.append((account_id, prompt, time.monotonic()))
         try:
-            time.sleep(self.delay)
+            if self.gate is not None:
+                self.gate(account_id, prompt)
+            else:
+                time.sleep(self.delay)
             yield f"reply:{prompt}"
         finally:
             with self.lock:
                 self.running[account_id] -= 1
                 self.total -= 1
+
 
 
 def _install(ids, limit=8, delay=0.4, queue_timeout=5):
@@ -315,6 +320,196 @@ def test_endpoint_same_sidechat_waits_for_commit():
     print("PASS: endpoint serializes one sidechat until ledger commit; other tickets run in parallel")
 
 
+def _temp_ledger():
+    import os
+    import tempfile
+
+    from sidechat import SidechatLedger
+
+    path = tempfile.mktemp(suffix=".json")
+    old = app.ledger
+    app.ledger = SidechatLedger(path)
+    return path, old, os
+
+
+def _restore_ledger(path, old, os_mod):
+    app.ledger = old
+    if path and os_mod.path.exists(path):
+        os_mod.remove(path)
+
+
+def test_concurrent_new_tickets_get_different_accounts():
+    """同一 role、不同工单同时到达：各占一个空闲号，不挤在 role_account_map 上。"""
+    _, eng, _ = _install(["a1", "a2", "a3"], limit=4, queue_timeout=5)
+    app.store.accounts[2]["ok"] = False  # a3 会话无效，不能拿来接新工单
+    path, old, os_mod = _temp_ledger()
+    app.ledger.set_role_account("ops", "a1")
+    release = threading.Event()
+
+    def gate(_account_id, _prompt):
+        if len(eng.calls) >= 2:
+            release.set()
+        assert release.wait(2), eng.calls
+
+    eng.gate = gate
+    try:
+        res = {}
+
+        def go(project):
+            acc, plan = app._route_chat_account("ops", project)
+            assert plan["spread_idle"] is True
+            assert plan["reason"] == "role_map"
+            assert plan["account_id"] == "a1"
+            assert plan["session_id"] is None
+            _run(res, project, acc["cookies"], project, None, 30, acc["id"], sidechat=plan)
+
+        threads = [threading.Thread(target=go, args=(name,)) for name in ("t1", "t2")]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert res["t1"] == "reply:t1" and res["t2"] == "reply:t2", res
+        used = [call[0] for call in eng.calls]
+        assert set(used) == {"a1", "a2"}, used
+        assert eng.peak_per_account.get("a1") == 1
+        assert eng.peak_per_account.get("a2") == 1
+        assert eng.peak_total == 2
+        assert "a3" not in used
+        assert app.ledger.snapshot()["role_account_map"] == {"ops": "a1"}
+    finally:
+        release.set()
+        _restore_ledger(path, old, os_mod)
+    print("PASS: two concurrent new tickets land on different accounts")
+
+
+def test_existing_sidechat_keeps_its_account():
+    """已有旁聊的工单继续用原账号，即使映射账号正空闲也不换。"""
+    from sidechat import ledger_key
+
+    _, eng, _ = _install(["a1", "a2"], limit=4, queue_timeout=5)
+    path, old, os_mod = _temp_ledger()
+    app.ledger.set_role_account("ops", "a1")
+    app.ledger.record_result(
+        ledger_key=ledger_key("ops", "ticket"),
+        role="ops", project="ticket",
+        account_id="a2", account_label="a2",
+        session_id="example-session-not-real", nav="fresh",
+    )
+    release = threading.Event()
+
+    def gate(_account_id, prompt):
+        if prompt == "hold":
+            release.wait(3)
+
+    eng.gate = gate
+    try:
+        res = {}
+        hold = threading.Thread(target=_run, args=(res, "hold", {}, "hold", None, 30, "a2"))
+        hold.start()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not any(call[1] == "hold" for call in eng.calls):
+            time.sleep(0.02)
+        assert any(call[1] == "hold" for call in eng.calls), eng.calls
+        acc, plan = app._route_chat_account("ops", "ticket")
+        assert plan["spread_idle"] is False
+        assert plan["account_id"] == "a2"
+        assert plan["session_id"] == "example-session-not-real"
+        ticket = threading.Thread(
+            target=_run,
+            args=(res, "ticket", acc["cookies"], "ticket", None, 30, acc["id"]),
+            kwargs={"sidechat": plan},
+        )
+        ticket.start()
+        time.sleep(0.3)
+        assert [call[1] for call in eng.calls] == ["hold"], eng.calls
+        release.set()
+        hold.join(3)
+        ticket.join(3)
+        assert res["ticket"] == "reply:ticket", res
+        assert [call[0] for call in eng.calls if call[1] == "ticket"] == ["a2"]
+        assert eng.peak_per_account["a2"] == 1
+        assert all(call[0] != "a1" for call in eng.calls)
+        snap = app.ledger.snapshot()
+        assert snap["role_account_map"] == {"ops": "a1"}
+        entry = next(item for item in snap["entries"] if item["ledger_key"] == "role:ops:proj:ticket")
+        assert entry["muse_account_id"] == "a2"
+        assert entry["session_id"] == "example-session-not-real"
+    finally:
+        release.set()
+        _restore_ledger(path, old, os_mod)
+    print("PASS: existing sidechat keeps its original account")
+
+
+def test_new_ticket_queues_when_no_account_is_idle():
+    """没有空闲号时排队，不抢占正在忙的账号，超时不写台账。"""
+    _, eng, commits = _install(["a1", "a2", "a3"], limit=4, queue_timeout=5)
+    app.store.accounts[2]["ok"] = False
+    path, old, os_mod = _temp_ledger()
+    app.ledger.set_role_account("ops", "a1")
+    release = threading.Event()
+
+    def gate(_account_id, prompt):
+        if str(prompt).startswith("hold"):
+            release.wait(3)
+
+    eng.gate = gate
+    try:
+        res = {}
+        holders = []
+        for aid in ("a1", "a2"):
+            thread = threading.Thread(
+                target=_run, args=(res, aid, {}, f"hold-{aid}", None, 30, aid))
+            holders.append(thread)
+            thread.start()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and len(eng.calls) < 2:
+            time.sleep(0.02)
+        assert len(eng.calls) == 2, eng.calls
+
+        app.CFG.queue_timeout = 0.4
+
+        def late():
+            acc, plan = app._route_chat_account("ops", "late")
+            assert plan["spread_idle"] is True
+            _run(res, "late", acc["cookies"], "late", None, 30, acc["id"], sidechat=plan)
+
+        late_thread = threading.Thread(target=late)
+        late_thread.start()
+        late_thread.join(2)
+        assert isinstance(res["late"], app.MuseQueueTimeout), res["late"]
+        assert "排队超时" in str(res["late"])
+        assert not any(call[1] == "late" for call in eng.calls), eng.calls
+        assert not any(key == "role:ops:proj:late" for key, _, _ in commits), commits
+        assert eng.peak_per_account.get("a1") == 1
+        assert eng.peak_per_account.get("a2") == 1
+
+        app.CFG.queue_timeout = 5
+
+        def fresh():
+            acc, plan = app._route_chat_account("ops", "fresh")
+            _run(res, "fresh", acc["cookies"], "fresh", None, 30, acc["id"], sidechat=plan)
+
+        fresh_thread = threading.Thread(target=fresh)
+        fresh_thread.start()
+        time.sleep(0.3)
+        assert not any(call[1] == "fresh" for call in eng.calls), eng.calls
+        release.set()
+        fresh_thread.join(3)
+        for thread in holders:
+            thread.join(3)
+        assert res["fresh"] == "reply:fresh", res
+        fresh_accounts = [call[0] for call in eng.calls if call[1] == "fresh"]
+        assert fresh_accounts in (["a1"], ["a2"]), fresh_accounts
+        assert eng.peak_per_account["a1"] == 1
+        assert eng.peak_per_account["a2"] == 1
+        assert "a3" not in [call[0] for call in eng.calls]
+        assert app.ledger.snapshot()["role_account_map"] == {"ops": "a1"}
+    finally:
+        release.set()
+        _restore_ledger(path, old, os_mod)
+    print("PASS: no idle account queues instead of preempting")
+
+
 if __name__ == "__main__":
     test_config_parsing()
     test_dynamic_limit_and_cap()
@@ -324,5 +519,8 @@ if __name__ == "__main__":
     test_busy_account_queue_timeout_no_failover()
     test_global_slot_timeout_no_failover()
     test_sidechat_gate()
+    test_concurrent_new_tickets_get_different_accounts()
+    test_existing_sidechat_keeps_its_account()
+    test_new_ticket_queues_when_no_account_is_idle()
     test_endpoint_same_sidechat_waits_for_commit()
     print("ALL ACCOUNT CONCURRENCY TESTS PASSED")

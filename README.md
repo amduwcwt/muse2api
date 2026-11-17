@@ -59,7 +59,7 @@ Upload one product photo and get talking-head sales videos, story-style ad short
   - 多账号同时生图、生视频、流式对话零互相阻塞，Cookie 与 Session 100% 隔离绝不串扰。
   - 内置智能账号冲突调度器，同账号自动互斥防踩踏，多账号自动并行跑满。
   - 可通过 `MUSE2API_CONCURRENCY` 随机器性能灵活调大并发上限（默认 2 并发）。
-  - `MUSE2API_CONCURRENCY=auto` 按可用账号数取上限。同一账号同一时间只跑一个请求；同一旁聊（`X-Muse-Role` + `X-Muse-Project`）从读台账到写回台账只放行一条，后到的排队，不会因为忙去换号或改绑定。`GET /admin/status` 的 `concurrency` 字段可看当前上限、占用的账号和排队中的旁聊。
+  - `MUSE2API_CONCURRENCY=auto` 按可用账号数取上限。同一账号同一时间只跑一个请求；同一旁聊（`X-Muse-Role` + `X-Muse-Project`）从读台账到写回台账只放行一条，后到的排队，不会因为忙去换号或改绑定。同一 role 下还没有旁聊的新工单优先占用当前空闲的账号，`role_account_map` 只在没有空闲号时作为排队偏好。`GET /admin/status` 的 `concurrency` 字段可看当前上限、占用的账号和排队中的旁聊。
 - 🔄 **多账号池与热连接亲和调度**
   - 支持导入无上限的 Muse 账号矩阵。
   - 基于热连接亲和（Warm-Tab Affinity）与 LRU 策略智能分发，兼顾 2 秒级极速响应与多号均衡消耗。
@@ -300,7 +300,7 @@ curl -X POST "http://localhost:18610/v1/chat/completions" \
 
 台账键：`role:ops`，或 `role:ops:proj:bridgeai`。字段见示例文件。`status` 为 `pending`（还没有 sessionId）、`active`（可续用）、`stale`（不再续用）、`deleted`（保留位）。`role_account_map` 把角色钉到账号池的 `id`；`default` 是没有单独映射时的兜底。映射不会自动改账号池。
 
-第一次使用某个键时，按映射选账号（映射的号不可用就换一个健康号），打开新旁聊，首条消息发出且 URL 变成 `/thread/<sessionId>` 后把 id 写回台账。之后同一键会打开这个 URL。打开失败、被重定向走，或气泡数达到 20，会把旧 id 记到 `prior_session_id` 并新建。账号禁用、重新导入 cookie、或会话认证失败时，该账号下的条目全部标 `stale`（session 不能换号接着用）。
+第一次使用某个键时，优先选当前空闲、启用且会话有效的账号；`role_account_map` 仍是偏好，只有没有空闲号时才退回映射账号并排队，不会抢占正在忙的号。映射的号不可用时仍换一个健康号。打开新旁聊，首条消息发出且 URL 变成 `/thread/<sessionId>` 后把 id 写回台账。之后同一键会打开这个 URL，并继续用原来的账号。打开失败、被重定向走，或气泡数达到 20，会把旧 id 记到 `prior_session_id` 并新建。账号禁用、重新导入 cookie、或会话认证失败时，该账号下的条目全部标 `stale`（session 不能换号接着用）。客户端断开时不自动切号，也不改台账。
 
 续用（`nav=resumed` / `reused`，台账里已有 `sessionId`）时，不再把全部 `messages` 粘成一段重发。条目上多三个可选字段：`sent_count`（已提交的非 system 轮次数）、`sent_fp`（这些轮次的 hash 前缀）、`sent_system_fp`（system/developer 的 hash 前缀）。请求里的轮次以前缀对上时，只把新增轮次发给 Muse；system 文本变了就带上最新的 system。对不上（历史被改写）会丢掉这个 `sessionId`、新开一条旁聊，并发送全量（截断规则见下），日志是 `sidechat prompt prefix mismatch`。旧条目没有这些字段时视为还没记过：这一轮仍打开原来的线程，但按全量发一次，成功后再补上指纹。指纹只在这轮确实吐出了回复之后写入；失败不推进，避免下一轮把没送出去的消息跳过。
 
@@ -333,7 +333,7 @@ python tools/sidechat_ledger.py stale role:ops   # 手工标 stale
 
 1. 不带 role 连续两次对话，应出现两条旁聊，第二条不接着第一条的上下文。
 2. `X-Muse-Role: ops` 连续两次，第二次打开同一个 `/thread/:id`。
-3. 同一 role 再加 `X-Muse-Project`，应是另一条旁聊；账号与 `role_account_map` 一致。
+3. 同一 role 再加 `X-Muse-Project`，应是另一条旁聊。两条同时在跑时会落到不同的空闲账号；映射账号只在没有空闲号时作为排队偏好。已经有 session 的工单仍用原来的账号。
 4. 把台账里的 `session_id` 改成不存在的值，下一次应新建并回填。
 5. `GET /admin/sidechats` 能看到条目，且响应里没有 cookie。
 
@@ -341,7 +341,7 @@ python tools/sidechat_ledger.py stale role:ops   # 手工标 stale
 
 旁聊 JSON 仍然只记 `session_id`、账号、`use_count`、`status`，外加可选的 `sent_count` / `sent_fp` / `sent_system_fp`（hash 前缀，不是正文）。用户消息和 Muse 回复写在 `data/relay.sqlite`（WAL）。不要把正文追加进 `sidechat_ledger.json`。
 
-客户端用请求头 `X-Muse-Conversation` 作为恢复键（Super Agent Engine 以后会传 `ticket.id`）。没有这个头时，每一轮只存本轮最后一条用户消息和回复。有这个头时，第一轮存 system 和第一条 user，之后只追加新消息，不把整段 `messages` 再写一遍。账号仍只由 `role_account_map` 和 `plan()` 决定，没有 `X-Muse-Account`。
+客户端用请求头 `X-Muse-Conversation` 作为恢复键（Super Agent Engine 以后会传 `ticket.id`）。没有这个头时，每一轮只存本轮最后一条用户消息和回复。有这个头时，第一轮存 system 和第一条 user，之后只追加新消息，不把整段 `messages` 再写一遍。账号仍由旁聊台账决定（已有旁聊钉住原账号；新建工单优先空闲号，`role_account_map` 作偏好），没有 `X-Muse-Account`。
 
 成功的 `/v1/chat/completions` 和 `/v1/responses` 会在响应头带回 `X-Muse-Conversation-Id`、`X-Muse-Session-Id`、`X-Muse-Nav`，JSON 里多一个 `muse` 对象。原有字段不变。落盘失败只打日志，对话仍返回。
 

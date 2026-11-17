@@ -302,6 +302,55 @@ class AccountPoolManager:
 
                 self.cond.wait(timeout=min(remaining, 0.5))
 
+    @staticmethod
+    def _session_valid(acc: dict | None) -> bool:
+        """启用、有 cookie、没被标坏。ok 还是 None（没探测过）算有效。"""
+        if not acc or not acc.get("id"):
+            return False
+        if not acc.get("enabled", True):
+            return False
+        if not acc.get("cookies"):
+            return False
+        if acc.get("ok") is False:
+            return False
+        return True
+
+    def claim_idle(self, preferred_id: str | None = None, timeout: float = 60.0,
+                   cancel_events=()) -> dict | None:
+        """新建工单占用一个当前空闲且会话有效的账号。
+
+        偏好账号（role_account_map）如果正空闲就用它，否则用最久没用的空闲号。
+        一个空闲号都没有时排队，直到有号空出来或超时；不把请求塞进正在忙的账号。
+        客户端已经断开时返回 None，不占号。
+        """
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        events = tuple(ev for ev in (cancel_events or ()) if ev is not None)
+        with self.cond:
+            while True:
+                if any(ev.is_set() for ev in events):
+                    return None
+                usable = [a for a in self.store.accounts if self._session_valid(a)]
+                idle = [a for a in usable if a["id"] not in self.busy_accounts]
+                if idle:
+                    by_id = {a["id"]: a for a in idle}
+                    if preferred_id and preferred_id in by_id:
+                        chosen = by_id[preferred_id]
+                    else:
+                        chosen = sorted(idle, key=lambda a: (
+                            a.get("last_used") or 0,
+                            a.get("use_count") or 0,
+                            str(a.get("id")),
+                        ))[0]
+                    self.busy_accounts.add(chosen["id"])
+                    return chosen
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise MuseQueueTimeout(
+                        f"没有空闲账号可接新工单（偏好 {_account_label(preferred_id)}），"
+                        f"排队超时（{CFG.queue_timeout}s），本条未发送；"
+                        "不会抢占正在忙的账号，请稍后重试")
+                self.cond.wait(timeout=min(remaining, 0.5))
+
     def release(self, account_id: str | None):
         if not account_id:
             return
@@ -569,23 +618,47 @@ def _chat_dimensions(req, header_role, header_project):
         raise HTTPException(400, str(exc)) from exc
 
 
+def _new_ticket_spread(plan: dict) -> bool:
+    """没有可续用的旁聊时，才允许改去当前空闲的号。
+
+    已有 session、翻页、条目上钉住的账号，以及故障切换已经选定的号，都保持不动。
+    """
+    if plan.get("session_id"):
+        return False
+    if plan.get("failover"):
+        return False
+    if plan.get("reason") in ("resume", "rollover", "entry"):
+        return False
+    return plan.get("reason") in ("role_map", "assign")
+
+
 def _route_chat_account(role: str | None, project: str | None):
-    """无 role/project 走策略 A（轮转账号 + 每次新旁聊）。有则按台账钉账号。"""
+    """无 role/project 走策略 A（轮转账号 + 每次新旁聊）。
+
+    有 role 时：已经有旁聊的工单钉住原账号。新建工单仍把 role_account_map
+    当作偏好账号返回；真正占号在 worker 里挑当前空闲的号，没有空闲就排队。
+    """
     plan = None
     if role or project:
         plan = ledger.plan(role, project, _sidechat_accounts())
     if plan and plan.get("strategy") == "bc" and plan.get("account_id"):
-        acc = store.pick_account(preferred_id=plan["account_id"], rotate=False)
+        plan = dict(plan)
+        plan["spread_idle"] = _new_ticket_spread(plan)
+        # 新建工单还没真正占号，不要先把偏好账号记成已使用。
+        acc = store.pick_account(
+            preferred_id=plan["account_id"], rotate=False,
+            record_use=not plan["spread_idle"],
+        )
         if not acc:
             raise HTTPException(400, "没有可用账号，请先在管理页面导入 cookie")
         if acc["id"] != plan["account_id"]:
             retired = plan.get("session_id") or plan.get("retire_session_id")
-            plan = dict(plan)
             plan["account_id"] = acc["id"]
             plan["account_label"] = acc.get("label") or ""
             plan["session_id"] = None
             plan["failover"] = True
             plan["reason"] = "failover"
+            plan["spread_idle"] = False
             if retired:
                 plan["retire_session_id"] = retired
         return acc, plan
@@ -787,7 +860,8 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                      stop_event: threading.Event | None = None,
                      client_gone: threading.Event | None = None,
                      lease: "SidechatLease | None" = None,
-                     queue_deadline: float | None = None):
+                     queue_deadline: float | None = None,
+                     account_holder: dict | None = None):
     """在独立线程中执行 chat_stream 并持有 GEN_LOCK，通过 Queue 往外吐。
     无论下游客户端何时断连、异常或超时，stop_event + finally 块保证 100% 立即释放 GEN_LOCK，绝不死锁。
     若首字前遇到单账号 VM 卡死或会话异常，且客户端还在，自动切换下一个健康账号重试一次。
@@ -795,7 +869,10 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
     换号时丢掉原来的 sessionId（旁聊不能跨账号续用）。
     一轮结束（含中断和异常）时调用 on_finished 一次。回调失败不影响吐字。
     排队（等本账号空闲、等全局槽位）共用 queue_deadline；超时报 MuseQueueTimeout，
-    不换号、不写台账。lease 是本旁聊的占用，worker 结束（台账已写回）后释放。"""
+    不换号、不写台账。lease 是本旁聊的占用，worker 结束（台账已写回）后释放。
+    新建工单（plan.spread_idle）先占一个当前空闲的号，偏好账号只在它也空闲时使用；
+    没有空闲号就排队，不抢占正在忙的账号。已有旁聊不改账号。
+    account_holder 若传入，会写成实际占用的账号 id，供调用方标记状态。"""
     import queue
     if queue_deadline is None:
         queue_deadline = time.monotonic() + CFG.queue_timeout
@@ -887,11 +964,41 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                         plan["account_id"] = cur_id
                         if retired:
                             plan["retire_session_id"] = retired
-                elif cur_id:
+                elif cur_id or (plan and plan.get("spread_idle")):
                     try:
-                        ACCOUNT_POOL.acquire(account_id=cur_id,
-                                             timeout=_queue_left(queue_deadline))
+                        if attempt == 0 and plan and plan.get("spread_idle"):
+                            if client_left():
+                                return
+                            preferred_id = plan.get("account_id") or cur_id
+                            alt = ACCOUNT_POOL.claim_idle(
+                                preferred_id=preferred_id,
+                                timeout=_queue_left(queue_deadline),
+                                cancel_events=(client_gone, stop_event),
+                            )
+                            if alt is None:
+                                log.info("chat client gone skip idle claim")
+                                return
+                            cur_id = alt["id"]
+                            leased_id = cur_id
+                            cur_cookies = alt.get("cookies") or cur_cookies
+                            cur_exp = alt.get("cookies_exp")
+                            if plan.get("account_id") != cur_id:
+                                log.info(
+                                    "sidechat new ticket idle account=%s preferred=%s",
+                                    cur_id, preferred_id,
+                                )
+                                plan["account_id"] = cur_id
+                                plan["account_label"] = alt.get("label") or ""
+                                if plan.get("reason") == "role_map":
+                                    plan["reason"] = "idle"
+                        else:
+                            ACCOUNT_POOL.acquire(account_id=cur_id,
+                                                 timeout=_queue_left(queue_deadline))
+                            leased_id = cur_id
                     except MuseAuthError as exc:
+                        last_exc = exc
+                        break
+                    except MuseQueueTimeout as exc:
                         last_exc = exc
                         break
                     except MuseGenerationError:
@@ -899,7 +1006,8 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                             f"账号 {_account_label(cur_id)} 正在处理别的请求（同一账号同时只跑一个），"
                             f"排队超时（{CFG.queue_timeout}s），本条未发送；不会换号，请稍后重试")
                         break
-                    leased_id = cur_id
+                    if account_holder is not None and cur_id:
+                        account_holder["id"] = cur_id
 
                 yielded = False
                 state.clear()
@@ -2587,6 +2695,7 @@ async def chat_completions(
         acc_id = acc["id"]
         cookies = acc["cookies"]
         expires = acc.get("cookies_exp")
+        account_holder = {"id": acc_id}
         relay_messages = list(req.messages)
         if not relay_messages and req.prompt:
             relay_messages = [ChatMessage(role="user", content=req.prompt)]
@@ -2625,6 +2734,7 @@ async def chat_completions(
                     chat_model=model, sidechat=sidechat, on_finished=on_finished,
                     stop_event=stop_event, client_gone=client_gone,
                     lease=lease, queue_deadline=queue_deadline,
+                    account_holder=account_holder,
                     **thread_args)
                 if not tool_note:
                     for chunk in stream_gen:
@@ -2671,14 +2781,14 @@ async def chat_completions(
                                 "choices": [],
                                 "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}})
                 yield "data: [DONE]\n\n"
-                store.mark(acc_id, True, "")
+                store.mark(account_holder["id"], True, "")
             except MuseQueueTimeout as exc:
                 yield _sse({"error": {"message": str(exc), "type": "server_error", "code": 503}})
             except MuseAuthError as exc:
-                store.mark(acc_id, False, str(exc))
+                store.mark(account_holder["id"], False, str(exc))
                 yield _sse({"error": {"message": str(exc), "type": "auth_error", "code": 401}})
             except MuseGenerationError as exc:
-                store.mark(acc_id, True, f"助手超时: {str(exc)[:60]}")
+                store.mark(account_holder["id"], True, f"助手超时: {str(exc)[:60]}")
                 try:
                     engine.reset_thread()
                 except Exception:
@@ -2702,6 +2812,7 @@ async def chat_completions(
                 chat_model=model, sidechat=sidechat, on_finished=on_finished,
                 stop_event=stop_event, client_gone=client_gone,
                 lease=lease, queue_deadline=queue_deadline,
+                account_holder=account_holder,
                 **thread_args))
         finally:
             lease.release_if_unstarted()

@@ -287,7 +287,8 @@ class SidechatLedger:
 
         只读。账号列表用 has_cookies / enabled / ok，不要把 cookie 值传进来。
         已有 active 旁聊时优先续用它所在的账号（session 不能跨号）。
-        role_account_map 用于新建，或当前条目的账号已不可用时。
+        role_account_map 是新建工单的偏好；调用方在有空闲号时可以改派到空闲账号，
+        没有空闲号时再退回这个偏好并排队。当前条目的账号已不可用时仍按映射或健康号切换。
         """
         accounts = list(accounts or [])
         if not role and not project:
