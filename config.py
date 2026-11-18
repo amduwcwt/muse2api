@@ -36,8 +36,12 @@ def _env(key: str, default: str) -> str:
     return os.environ.get(key, default)
 
 
-def max_prompt_chars() -> int:
-    """新线程全量提示词上限。非法或非正数退回 200000。"""
+def max_prompt_bytes() -> int:
+    """新线程全量提示词上限，按 UTF-8 字节计。非法或非正数退回 200000。
+
+    环境变量名仍是 MUSE2API_MAX_PROMPT_CHARS。数值是字节，不是字符：
+    一段中文或 emoji 会比同样的字符数更早触顶。
+    """
     raw = _env("MUSE2API_MAX_PROMPT_CHARS", "200000").strip()
     try:
         value = int(raw)
@@ -46,6 +50,11 @@ def max_prompt_chars() -> int:
     if value <= 0:
         return 200000
     return value
+
+
+def max_prompt_chars() -> int:
+    """旧名字。返回值与 max_prompt_bytes() 相同，单位是字节。"""
+    return max_prompt_bytes()
 
 
 def _detect_chromium() -> str:
@@ -132,8 +141,8 @@ class Config:
     image_timeout: int = field(default_factory=lambda: int(_env("MUSE2API_IMAGE_TIMEOUT", "240")))
     video_timeout: int = field(default_factory=lambda: int(_env("MUSE2API_VIDEO_TIMEOUT", "600")))
     chat_timeout: int = field(default_factory=lambda: int(_env("MUSE2API_CHAT_TIMEOUT", "300")))
-    # 新旁聊 / 全量历史的提示词字符上限。续用命中时只发新增消息，不走这条截断。
-    max_prompt_chars: int = field(default_factory=lambda: max_prompt_chars())
+    # 新旁聊 / 全量历史的提示词上限，UTF-8 字节。续用命中时只发新增消息，不走这条截断。
+    max_prompt_chars: int = field(default_factory=lambda: max_prompt_bytes())
     # 全局并发上限。整数=固定槽位；auto=按「启用且有 cookie、未标坏」的账号数动态取值。
     # 同一账号同一时间只跑一个请求（AccountPoolManager），所以实际并行度不会超过可用号数。
     max_concurrency: int = field(default_factory=lambda: concurrency_limit())

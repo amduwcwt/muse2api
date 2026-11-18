@@ -63,7 +63,8 @@ from config import CFG
 from engine import (ESSENTIAL_COOKIES, MAX_REFERENCE_IMAGE_BYTES,
                     MAX_REFERENCE_IMAGES, MAX_REFERENCE_TOTAL_BYTES,
                     REFERENCE_MIME_EXT, MuseAuthError, MuseEngine, MuseGenerationError,
-                    MuseModelRefusalError, RefImageSafetyError, reference_kind)
+                    MuseModelRefusalError, MusePromptTooLargeError, RefImageSafetyError,
+                    ensure_prompt_within_cap, prompt_nbytes, reference_kind)
 from engine import MuseProxyError
 from store import Store, account_expiry, min_expiry
 from proxy import normalize_server, request_proxy_context, split_proxy_url
@@ -964,6 +965,9 @@ def safe_chat_stream(cookies: dict, prompt: str, expires: dict | None,
                     engine.close_current_page()
                     if yielded:
                         break
+                except MusePromptTooLargeError as exc:
+                    last_exc = exc
+                    break
                 except Exception as exc:
                     last_exc = exc
                     if client_left():
@@ -1414,8 +1418,8 @@ def message_fingerprint(messages) -> str:
 
 
 def _fit_chat_messages(messages: list[ChatMessage], limit: int) -> tuple[list[ChatMessage], int]:
-    """超长时保留 system、首条 user 和最近消息，中间换成一行省略说明。"""
-    if len(build_chat_prompt(messages)) <= limit:
+    """超长时保留 system、首条 user 和最近消息，中间换成一行省略说明。limit 是 UTF-8 字节。"""
+    if prompt_nbytes(build_chat_prompt(messages)) <= limit:
         return messages, 0
     system, turns = _split_chat_messages(messages)
     first_idx = next((i for i, item in enumerate(turns) if _msg_role(item) == "user"), None)
@@ -1440,7 +1444,7 @@ def _fit_chat_messages(messages: list[ChatMessage], limit: int) -> tuple[list[Ch
     while lo <= hi:
         mid = (lo + hi) // 2
         packed, _omitted = pack(mid)
-        if len(build_chat_prompt(packed)) <= limit:
+        if prompt_nbytes(build_chat_prompt(packed)) <= limit:
             best = mid
             lo = mid + 1
         else:
@@ -1449,10 +1453,10 @@ def _fit_chat_messages(messages: list[ChatMessage], limit: int) -> tuple[list[Ch
 
 
 def _render_limited_prompt(messages: list[ChatMessage], limit: int) -> tuple[str, int, int]:
-    """返回 (提示词, 省略条数, 截断前字符数)。未超限时省略条数为 0。"""
+    """返回 (提示词, 省略条数, 截断前字符数)。limit 是 UTF-8 字节。未超限时省略条数为 0。"""
     before = build_chat_prompt(messages)
     before_chars = len(before)
-    if before_chars <= limit:
+    if prompt_nbytes(before) <= limit:
         return before, 0, before_chars
     fitted, omitted = _fit_chat_messages(messages, limit)
     return build_chat_prompt(fitted), omitted, before_chars
@@ -1473,7 +1477,7 @@ def compose_chat_prompt(messages, sidechat: dict | None = None, *,
     旁聊续用且请求轮次以前缀对齐已发送指纹时，只发新增轮次；系统提示变了就带上最新的。
     指纹对不上（历史被改写）时清掉 session，改开新旁聊并发全量。
     旧条目没有指纹、且全文放得进上限时，仍续用原线程，这一轮发全量，成功后再把指纹写回去。
-    没有指纹且全文会超过 MUSE2API_MAX_PROMPT_CHARS（会截断，omitted > 0）时，
+    没有指纹且全文会超过 MUSE2API_MAX_PROMPT_CHARS 的字节上限（会截断，omitted > 0）时，
     不把截断后的全文倒进旧会话，改开新旁聊，只把截断后的全量发给新线程。
     台账要等这条新线程成功吐字后再改，失败中途不动。
     全量超过上限时截中间，并打 WARNING（含 prompt_chars）。
@@ -1875,12 +1879,21 @@ def _pos(v) -> bool:
         return False
 
 
+def _reject_oversized_prompt(prompt: str) -> None:
+    """整体字节上限。超限是 413，不能等浏览器把 Noise 帧打成 502。"""
+    try:
+        ensure_prompt_within_cap(prompt, CFG.max_prompt_chars)
+    except MusePromptTooLargeError as exc:
+        raise HTTPException(413, str(exc)) from exc
+
+
 def _run_generation(prompt: str, kind: str, timeout: int,
                     account_id: str | None = None, on_progress=None,
                     reference_image: str | None = None,
                     reference_images: list[str] | None = None,
                     on_acquired=None) -> tuple[dict, str | None]:
     # Browser ownership covers account selection, retry and cleanup, not just generate().
+    ensure_prompt_within_cap(prompt, CFG.max_prompt_chars)
     deadline = time.monotonic() + max(1, timeout)
     if not GEN_LOCK.acquire(timeout=max(1, timeout)):
         raise MuseGenerationError("等待浏览器队列超时，请稍后重试")
@@ -1961,6 +1974,8 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                 last_exc = exc
                 store.touch_keepalive(cur_acc["id"], None, f"代理异常: {str(exc)[:160]}")
                 engine.close_current_page()
+            except MusePromptTooLargeError:
+                raise
             except MuseGenerationError as exc:
                 last_exc = exc
                 store.mark(cur_acc["id"], True, f"任务异常: {str(exc)[:60]}")
@@ -2038,6 +2053,7 @@ def _prepare_reference_images(images: list[str]) -> list[str]:
 def _queue_image(req: ImageRequest, prompt: str, reference_images: list[str],
                  idempotency_key: str | None = None):
     """Opt-in polling avoids reverse-proxy timeouts; no generation is repeated by polling."""
+    _reject_oversized_prompt(prompt)
     if idempotency_key and len(idempotency_key) > 256:
         raise HTTPException(400, "Idempotency-Key too long")
     key_hash = hashlib.sha256(idempotency_key.encode()).hexdigest() if idempotency_key else None
@@ -2127,6 +2143,8 @@ async def images_generations(req: ImageRequest, _=Depends(auth)):
             _run_generation, prompt, "image", timeout, reference_images=ref_images)
     except MuseAuthError as exc:
         raise HTTPException(401, str(exc)) from exc
+    except MusePromptTooLargeError as exc:
+        raise HTTPException(413, str(exc)) from exc
     except MuseGenerationError as exc:
         raise HTTPException(502, str(exc)) from exc
     return _image_response(req, res)
@@ -2226,6 +2244,8 @@ async def images_edits(request: Request, _=Depends(auth)):
             reference_images=ref_image_data)
     except MuseAuthError as exc:
         raise HTTPException(401, str(exc)) from exc
+    except MusePromptTooLargeError as exc:
+        raise HTTPException(413, str(exc)) from exc
     except MuseGenerationError as exc:
         raise HTTPException(502, str(exc)) from exc
 
@@ -2240,6 +2260,7 @@ async def create_video(req: VideoRequest, _=Depends(auth)):
         _prepare_reference_images, _video_references(req))
 
     prompt = build_video_prompt(req, _reference_kinds(ref_images))
+    _reject_oversized_prompt(prompt)
     timeout = req.timeout or CFG.video_timeout
     task = store.create_task("video", req.prompt)
     store.update_task(task["id"], api_prompt=prompt)
@@ -2581,6 +2602,7 @@ async def chat_completions(
             prompt = prompt + "\n\n" + tool_note
             full_prompt = full_prompt + "\n\n" + tool_note
         thread_args = _thread_prompt_args(delivery, full_prompt)
+        _reject_oversized_prompt(prompt)
 
         cid = "chatcmpl-" + uuid.uuid4().hex[:24]
         created = int(time.time())
@@ -2677,6 +2699,8 @@ async def chat_completions(
             except MuseAuthError as exc:
                 store.mark(acc_id, False, str(exc))
                 yield _sse({"error": {"message": str(exc), "type": "auth_error", "code": 401}})
+            except MusePromptTooLargeError as exc:
+                yield _sse({"error": {"message": str(exc), "type": "invalid_request_error", "code": 413}})
             except MuseGenerationError as exc:
                 store.mark(acc_id, True, f"助手超时: {str(exc)[:60]}")
                 try:
@@ -2717,6 +2741,8 @@ async def chat_completions(
             raise HTTPException(503, str(exc), headers={"Retry-After": "30", **_muse_headers(box.get("info"))})
         except MuseAuthError as exc:
             raise HTTPException(401, str(exc), headers=_muse_headers(box.get("info")))
+        except MusePromptTooLargeError as exc:
+            raise HTTPException(413, str(exc), headers=_muse_headers(box.get("info")))
         except MuseGenerationError as exc:
             raise HTTPException(502, str(exc), headers=_muse_headers(box.get("info")))
     finally:
@@ -2806,6 +2832,7 @@ async def responses_api(
         thread_args = _thread_prompt_args(delivery, delivery.get("full_prompt") or prompt)
         if not prompt:
             raise HTTPException(400, "input 为空")
+        _reject_oversized_prompt(prompt)
 
         rid = "resp_" + uuid.uuid4().hex[:24]
         mid = "msg_" + uuid.uuid4().hex[:24]
@@ -2882,7 +2909,9 @@ async def responses_api(
             except Exception as exc:  # noqa: BLE001
                 log.warning("responses stream failed err=%s", type(exc).__name__)
                 failed = envelope("failed", info=box.get("info"))
-                if isinstance(exc, MuseQueueTimeout):
+                if isinstance(exc, MusePromptTooLargeError):
+                    failed["error"] = {"code": 413, "message": str(exc)}
+                elif isinstance(exc, MuseQueueTimeout):
                     failed["error"] = {"code": "queue_timeout", "message": str(exc)}
                 yield _sse_event("response.failed", {
                     "type": "response.failed",
@@ -2918,6 +2947,8 @@ async def responses_api(
             raise HTTPException(503, str(exc), headers={"Retry-After": "30", **_muse_headers(box.get("info"))})
         except MuseAuthError as exc:
             raise HTTPException(401, str(exc), headers=_muse_headers(box.get("info")))
+        except MusePromptTooLargeError as exc:
+            raise HTTPException(413, str(exc), headers=_muse_headers(box.get("info")))
         except MuseGenerationError as exc:
             raise HTTPException(502, str(exc), headers=_muse_headers(box.get("info")))
     finally:

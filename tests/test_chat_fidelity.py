@@ -20,7 +20,7 @@ sys.path.insert(0, str(ROOT))
 import app  # noqa: E402
 import engine as engine_mod  # noqa: E402
 from chat_extract import INSTALL_JS, poll_expression  # noqa: E402
-from config import max_prompt_chars  # noqa: E402
+from config import max_prompt_bytes, max_prompt_chars  # noqa: E402
 from sidechat import SidechatLedger  # noqa: E402
 
 CODE = "const t = `hi ${name}`;\nreturn Promise<void>;\n/** keep stars */\nline\\nnext\nconst kind: typeof X = 1;"
@@ -376,9 +376,9 @@ def test_prompt_cursor_and_truncation():
         recent = app.ChatMessage(role="user", content="RECENT_MARK")
         marker = app.ChatMessage(role="user", content="[省略 2 条早期消息]")
         kept_messages = [system, user_a, marker, recent]
-        limit = len(app.build_chat_prompt(kept_messages))
+        limit = len(app.build_chat_prompt(kept_messages).encode("utf-8"))
         full = [system, user_a, drop_one, drop_two, recent]
-        assert len(app.build_chat_prompt(full)) > limit
+        assert len(app.build_chat_prompt(full).encode("utf-8")) > limit
         records.clear()
         truncated = app.compose_chat_prompt(full, None, limit=limit)
         assert truncated["omitted"] == 2
@@ -415,7 +415,7 @@ def _history_parts():
 
 
 def _fit_limit(kept: list) -> int:
-    return len(app.build_chat_prompt(kept))
+    return len(app.build_chat_prompt(kept).encode("utf-8"))
 
 
 def test_failover_new_thread_uses_full_history():

@@ -35,6 +35,7 @@ import unicodedata
 
 from cdp import CDP, http_json
 from chat_extract import INSTALL_JS, poll_expression
+from config import max_prompt_bytes
 from proxy import HTTPProxyRelay, request_proxy_context
 from sidechat import BUBBLE_ROLLOVER, session_id_from_path, thread_url
 
@@ -218,6 +219,71 @@ class MuseAuthError(RuntimeError):
 
 class MuseGenerationError(RuntimeError):
     pass
+
+
+class MusePromptTooLargeError(MuseGenerationError):
+    """提示词的 UTF-8 字节数超过配置上限。调用方应返回 HTTP 413，而不是 502。"""
+
+
+# Noise 传输层 encrypt() 拒绝超过 65535 字节的明文
+# （NoiseInvalidMessage: Data must be bytes and less or equal 65535 bytes）。
+# 帧里还要放 protobuf / JSON 包装，所以明文目标留出余量。
+NOISE_MAX_FRAME_BYTES = 65535
+NOISE_FRAME_PLAINTEXT_BYTES = 60000
+
+
+def prompt_nbytes(text: str) -> int:
+    return len((text or "").encode("utf-8"))
+
+
+def prompt_byte_cap(cfg=None) -> int:
+    raw = getattr(cfg, "max_prompt_chars", None) if cfg is not None else None
+    if isinstance(raw, int) and not isinstance(raw, bool) and raw > 0:
+        return raw
+    return max_prompt_bytes()
+
+
+def ensure_prompt_within_cap(prompt: str, cap: int | None = None) -> int:
+    """超过整体字节上限就拒绝。返回实际字节数。"""
+    size = prompt_nbytes(prompt)
+    limit = max_prompt_bytes() if cap is None else int(cap)
+    if limit <= 0:
+        limit = max_prompt_bytes()
+    if size > limit:
+        raise MusePromptTooLargeError(
+            f"提示词超过字节上限（{size} > {limit}），请缩短后再试"
+        )
+    return size
+
+
+def split_utf8_frames(text: str, limit: int = NOISE_FRAME_PLAINTEXT_BYTES) -> list[str]:
+    """把文本切成有序帧。每帧 UTF-8 不超过 limit，且不超过 65535。
+
+    只在字符边界切开，不会把一个多字节字符拆到两帧。
+    ``"".join(frames)`` 等于原文。空串得到一帧空串。
+    帧在 ``split_utf8_frames`` 里组好，``MuseEngine._send`` 再按顺序写入输入框。
+    """
+    if limit > NOISE_MAX_FRAME_BYTES:
+        limit = NOISE_MAX_FRAME_BYTES
+    if limit < 1:
+        raise ValueError("frame limit must be positive")
+    data = (text or "").encode("utf-8")
+    if len(data) <= limit:
+        return [text or ""]
+    frames: list[str] = []
+    start = 0
+    total = len(data)
+    while start < total:
+        end = min(start + limit, total)
+        if end < total:
+            # 续字节是 10xxxxxx。退回到当前字符的起始字节。
+            while end > start and (data[end] & 0xC0) == 0x80:
+                end -= 1
+            if end == start:
+                raise ValueError("frame limit is smaller than one UTF-8 character")
+        frames.append(data[start:end].decode("utf-8"))
+        start = end
+    return frames
 
 
 class MuseProxyError(MuseGenerationError):
@@ -1233,7 +1299,40 @@ class MuseEngine:
         "return JSON.stringify({v:ta?ta.value:'',btn:b?(b.disabled?2:1):0});})()"
     )
 
+    # 每一帧只带这一段明文。append 时在页面里拼到已有内容后面，
+    # 这样单次写入不超过 Noise 明文上限，输入框里最后仍是完整原文。
+    _PASTE_FRAME_JS = (
+        "(function(t,append){var ta=document.querySelector('textarea');"
+        "if(!ta) return 0;"
+        "ta.focus();"
+        "var s=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set;"
+        "var next=append?((ta.value||'')+t):t;"
+        "s.call(ta,next);"
+        "try{ta.dispatchEvent(new InputEvent('input',{bubbles:true,data:t,inputType:'insertText'}));}"
+        "catch(e){ta.dispatchEvent(new Event('input',{bubbles:true}));}"
+        "ta.dispatchEvent(new Event('change',{bubbles:true}));"
+        "return (ta.value||'').length;})(%s,%s)"
+    )
+
+    def _paste_prompt_frame(self, frame: str, *, append: bool) -> int:
+        """把一帧明文写进输入框。frame 的 UTF-8 长度已由 split_utf8_frames 限制。"""
+        payload = frame.encode("utf-8")
+        if len(payload) > NOISE_MAX_FRAME_BYTES:
+            raise MuseGenerationError(
+                f"Noise 帧超过 65535 字节（{len(payload)}）"
+            )
+        expr = self._PASTE_FRAME_JS % (json.dumps(frame), "true" if append else "false")
+        try:
+            return int(self.page.js(expr) or 0)
+        except Exception:
+            return 0
+
     def _send(self, prompt: str):
+        # 超过整体字节上限直接拒绝（413），不要等上游 Noise 把超长帧打成 502。
+        ensure_prompt_within_cap(prompt, prompt_byte_cap(self.cfg))
+        # 帧在这里按顺序组好。每帧约 60000 字节明文，页面依次追加，
+        # 点发送时输入框里的全文与原提示词相同。
+        frames = split_utf8_frames(prompt)
         # 1. 确保 textarea 滚动到视口中央并获得真实焦点
         try:
             self.page.js("""(function(){
@@ -1261,21 +1360,13 @@ class MuseEngine:
                             "button": "left", "clickCount": 1})
         time.sleep(0.1)
 
-        # 触发 React 18 原型 setter 以及 input/change 事件以同步发送按钮状态
-        # （对于 DeepSeek/Codex 等 100KB+ 超长上下文，直接走原型 setter 仅需 <1s，避免 Input.insertText 逐字注入卡死）
-        _SETTER_JS = (
-            "(function(t){var ta=document.querySelector('textarea');"
-            "if(!ta) return 0;"
-            "ta.focus();"
-            "var s=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value').set;"
-            "s.call(ta,t);"
-            "ta.dispatchEvent(new Event('input',{bubbles:true}));"
-            "ta.dispatchEvent(new Event('change',{bubbles:true}));"
-            "return (ta.value||'').length;})(%s)")
-        val_len = self.page.js(_SETTER_JS % json.dumps(prompt)) or 0
-        if not val_len and len(prompt) < 500:
-            self.page.send("Input.insertText", {"text": prompt})
-            self.page.js(_SETTER_JS % json.dumps(prompt))
+        # 按帧写入。单帧走原型 setter（100KB 级上下文也不会整段塞进一次 Noise 明文）。
+        # setter 没生效且这一帧很短时，退回 Input.insertText，仍然只发这一帧。
+        for index, frame in enumerate(frames):
+            val_len = self._paste_prompt_frame(frame, append=index > 0)
+            if frame and not val_len and len(frame) < 500:
+                self.page.send("Input.insertText", {"text": frame})
+                self._paste_prompt_frame(frame, append=index > 0)
 
         # 等待发送按钮就绪并点击
         clicked = "no-button"
